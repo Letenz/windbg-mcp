@@ -1,0 +1,10 @@
+LIBRARY mcpext
+
+EXPORTS
+    DebugExtensionInitialize
+    DebugExtensionUninitialize
+    DebugExtensionNotify
+    start    @1
+    stop     @2
+    status   @3
+    help     @4

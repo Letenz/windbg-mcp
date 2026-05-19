@@ -1,0 +1,23 @@
+# Build outputs
+/build/
+/out/
+/cmake-build-*/
+/release-staging/
+
+# Python venv + caches
+server/.venv/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+
+# Editor / IDE
+.vs/
+.vscode/
+.idea/
+*.user
+
+# OS
+Thumbs.db
+.DS_Store
