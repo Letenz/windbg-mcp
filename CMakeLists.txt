@@ -5,7 +5,7 @@ cmake_minimum_required(VERSION 3.20)
 cmake_policy(SET CMP0091 NEW)
 
 project(windbg-mcp
-    VERSION 1.0.0
+    VERSION 2.0.0
     LANGUAGES CXX
     DESCRIPTION "Clean-room WinDbg <-> MCP bridge for AI-driven kernel debugging."
 )
@@ -44,6 +44,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 # explicitly so the released binary is still as small/optimised as without
 # debug info.
 if(MSVC)
+    add_compile_options(/utf-8)
     add_compile_options($<$<CONFIG:Release>:/Zi>)
     add_link_options(
         $<$<CONFIG:Release>:/DEBUG>

@@ -10,10 +10,15 @@
 #include "events/event_history.h"
 
 #include <condition_variable>
+#include <atomic>
+#include <cstdint>
+#include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace windbgmcp::ipc { class PipeServer; }
@@ -24,7 +29,13 @@ class Publisher {
 public:
     static Publisher& Get();
 
-    void SetPipe(ipc::PipeServer* pipe) { m_pipe = pipe; }
+    void SetPipe(const std::shared_ptr<ipc::PipeServer>& pipe);
+    void ClearPipe();
+    void ResumeWaiters();
+    void CancelWaiters();
+    std::uint64_t DroppedEvents() const noexcept {
+        return m_dropped_events.load(std::memory_order_relaxed);
+    }
 
     // Push a fully-formed event. Thread-safe; can be called from dbgeng
     // callbacks.
@@ -42,11 +53,28 @@ private:
 
     bool MatchesAny(const Event& e, const std::vector<std::string>& kinds) const;
 
-    ipc::PipeServer*                m_pipe = nullptr;
+    void SenderLoop();
+
+    struct OutboundFrame {
+        std::string payload;
+        std::uint64_t generation = 0;
+    };
+
+    static constexpr std::size_t kOutboundCapacity = 256;
+
+    std::mutex                      m_pipe_mu;
+    std::weak_ptr<ipc::PipeServer>  m_pipe;
+    std::mutex                      m_out_mu;
+    std::condition_variable         m_out_cv;
+    std::deque<OutboundFrame>       m_outbound;
+    std::thread                     m_sender;
+    bool                            m_sender_running = false;
+    std::atomic<std::uint64_t>      m_dropped_events{0};
     std::mutex                      m_mu;
     std::condition_variable         m_cv;
     Event                           m_last;       // last published event
     std::uint64_t                   m_seq = 0;    // monotonic seq for waiters
+    bool                            m_waits_cancelled = false;
 };
 
 } // namespace windbgmcp::events

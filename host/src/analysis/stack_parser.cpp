@@ -19,7 +19,9 @@ std::string StripTick(std::string s) {
 std::string LowerHex(std::string s) {
     auto t = StripTick(std::move(s));
     std::transform(t.begin(), t.end(), t.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
+                   [](unsigned char c) {
+                       return static_cast<char>(std::tolower(c));
+                   });
     if (t.rfind("0x", 0) != 0) t = "0x" + t;
     return t;
 }

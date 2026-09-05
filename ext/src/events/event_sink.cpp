@@ -2,11 +2,13 @@
 #include "events/event_sink.h"
 
 #include "events/publisher.h"
+#include "lifecycle/unload_barrier.h"
 #include "util/debug_client.h"
 #include "util/log.h"
 #include "util/status.h"
 
 #include <cstdio>
+#include <chrono>
 #include <string>
 
 // STATUS_BREAKPOINT is the only NTSTATUS we need; define it locally to avoid
@@ -60,57 +62,10 @@ std::string HexU32(ULONG v) {
     return buf;
 }
 
-// Try to resolve a faulting module name + offset for the given IP.
-json ResolveFaultingModule(ULONG64 ip) {
-    auto client = dbg::Get();
-    if (!client) return nullptr;
-    CComQIPtr<IDebugSymbols3> sym(client);
-    if (!sym) return nullptr;
-
-    ULONG64 mod_base = 0;
-    ULONG mod_index  = 0;
-    if (FAILED(sym->GetModuleByOffset(ip, 0, &mod_index, &mod_base))) {
-        return nullptr;
-    }
-    char name[256] = {0};
-    ULONG name_size = 0;
-    if (FAILED(sym->GetModuleNames(mod_index, mod_base,
-                                   nullptr, 0, nullptr,
-                                   name, sizeof(name), &name_size,
-                                   nullptr, 0, nullptr))) {
-        return nullptr;
-    }
-    return json{
-        {"name",   std::string(name)},
-        {"base",   HexU64(mod_base)},
-        {"offset", HexU64(ip - mod_base)},
-    };
-}
-
-ULONG CurrentThreadId() {
-    auto client = dbg::Get();
-    if (!client) return 0;
-    CComQIPtr<IDebugSystemObjects> sys(client);
-    if (!sys) return 0;
-    ULONG tid = 0;
-    sys->GetCurrentThreadSystemId(&tid);
-    return tid;
-}
-
-ULONG64 CurrentIp() {
-    auto client = dbg::Get();
-    if (!client) return 0;
-    CComQIPtr<IDebugRegisters2> regs(client);
-    if (!regs) return 0;
-    ULONG64 ip = 0;
-    if (FAILED(regs->GetInstructionOffset(&ip))) return 0;
-    return ip;
-}
-
 } // namespace
 
-EventSink* EventSink::Create() {
-    return new EventSink();
+EventSink* EventSink::Create(ClientFactory client_factory) {
+    return new EventSink(std::move(client_factory));
 }
 
 // ---- IUnknown ------------------------------------------------------------
@@ -190,8 +145,13 @@ STDMETHODIMP EventSink::Exception(PEXCEPTION_RECORD64 ex, ULONG /*first_chance*/
                     {"name",            BugcheckName(bc)},
                     {"params",          params},
                     {"ip",              HexU64(ip)},
-                    {"faulting_module", ResolveFaultingModule(ip)},
-                    {"thread_id",       CurrentThreadId()},
+                    // Event callbacks can be delivered on WinDbg's engine
+                    // thread rather than the dedicated client's creator
+                    // thread. Never use m_client here; detailed module/thread
+                    // context is collected safely by the request actor after
+                    // the target is stopped.
+                    {"faulting_module", nullptr},
+                    {"thread_id",       0},
                 }
             };
             m_pending_bugcheck.store(true);
@@ -295,8 +255,11 @@ STDMETHODIMP EventSink::ChangeEngineState(ULONG flags, ULONG64 argument) {
             NowMs(), "break",
             json{
                 {"reason",         reason},
-                {"ip",             HexU64(CurrentIp())},
-                {"thread_id",      CurrentThreadId()},
+                // ChangeEngineState does not carry register/thread context,
+                // and using the actor-owned client from this callback can
+                // violate dbgeng thread affinity.
+                {"ip",             HexU64(0)},
+                {"thread_id",      0},
                 {"prior_status",   status::ToString(prev)},
                 {"current_status", status::ToString(new_status)},
             }
@@ -310,16 +273,129 @@ STDMETHODIMP EventSink::ChangeEngineState(ULONG flags, ULONG64 argument) {
 STDMETHODIMP EventSink::ChangeSymbolState(ULONG, ULONG64) { return DEBUG_STATUS_NO_CHANGE; }
 
 // ---- Install / Uninstall -------------------------------------------------
-bool EventSink::Install() {
-    auto client = dbg::Get();
-    if (!client) return false;
-    return SUCCEEDED(client->SetEventCallbacks(this));
+bool EventSink::InstallAsync() {
+    if (m_owner_thread.joinable()) return false;
+    {
+        std::lock_guard<std::mutex> lk(m_owner_mu);
+        m_stop_requested = false;
+        m_uninstall_ok = false;
+        m_install_state.store(InstallState::Installing);
+    }
+
+    try {
+        m_owner_thread = std::thread([this] { OwnerLoop(); });
+    } catch (...) {
+        m_install_state.store(InstallState::Failed);
+        return false;
+    }
+    return true;
 }
 
-void EventSink::Uninstall() {
-    auto client = dbg::Get();
-    if (!client) return;
-    client->SetEventCallbacks(nullptr);
+const char* EventSink::StateText() const noexcept {
+    switch (State()) {
+        case InstallState::NotStarted: return "not started";
+        case InstallState::Installing: return "installing";
+        case InstallState::Installed:  return "installed (dedicated client)";
+        case InstallState::Failed:     return "FAILED";
+        case InstallState::Stopped:    return "stopped";
+    }
+    return "unknown";
+}
+
+bool EventSink::IsOwnerThread() const noexcept {
+    return m_owner.IsCurrent();
+}
+
+bool EventSink::Uninstall() {
+    if (!m_owner_thread.joinable()) return true;
+    if (IsOwnerThread()) return false;
+    {
+        std::lock_guard<std::mutex> lk(m_owner_mu);
+        m_stop_requested = true;
+        m_owner_cv.notify_all();
+    }
+    m_owner_thread.join();
+    std::lock_guard<std::mutex> lk(m_owner_mu);
+    m_install_state.store(InstallState::Stopped);
+    return m_uninstall_ok;
+}
+
+void EventSink::OwnerLoop() {
+    lifecycle::ActivityGuard activity(lifecycle::ActivityKind::CallbackActor);
+    m_owner.CaptureCurrent();
+
+    IDebugClient* callback_client = nullptr;
+    HRESULT hr = E_FAIL;
+    {
+        // DebugCreate and callback registration share dbgeng's process-wide
+        // engine with the request lane. Serialize them so the two clients do
+        // not race the KD transport once !mcpext.start has returned.
+        std::lock_guard<std::mutex> engine_lk(dbg::Lock());
+        hr = m_client_factory
+                 ? m_client_factory(&callback_client)
+                 : ::DebugCreate(__uuidof(IDebugClient),
+                                 reinterpret_cast<void**>(&callback_client));
+        if (SUCCEEDED(hr) && callback_client) {
+            m_client.Attach(callback_client);
+            hr = m_client->SetEventCallbacks(this);
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(m_owner_mu);
+        m_install_state.store(SUCCEEDED(hr) && m_client
+                                  ? InstallState::Installed
+                                  : InstallState::Failed);
+        m_owner_cv.notify_all();
+    }
+
+    if (SUCCEEDED(hr) && m_client) {
+        while (true) {
+            {
+                std::unique_lock<std::mutex> lk(m_owner_mu);
+                if (m_stop_requested) break;
+            }
+
+            // Client callbacks are delivered on this owner thread while it
+            // pumps the debugger engine. Keep the pump non-blocking: the
+            // condition-variable wait below provides pacing and lets the
+            // request lane acquire the shared engine lock promptly.
+            HRESULT dispatch_hr = E_FAIL;
+            {
+                std::lock_guard<std::mutex> engine_lk(dbg::Lock());
+                dispatch_hr = m_client->DispatchCallbacks(0);
+            }
+
+            // DispatchCallbacks normally returns S_FALSE on timeout. Always
+            // yield between pumps, including on success/S_FALSE, so the
+            // request actor gets a bounded opportunity to acquire dbgeng.
+            std::unique_lock<std::mutex> lk(m_owner_mu);
+            m_owner_cv.wait_for(lk, std::chrono::milliseconds(10),
+                                [this] { return m_stop_requested; });
+            (void)dispatch_hr;
+        }
+
+        {
+            std::lock_guard<std::mutex> engine_lk(dbg::Lock());
+            hr = m_client->SetEventCallbacks(nullptr);
+            if (FAILED(hr)) {
+                WMCP_LOG(Error, "dedicated callback client failed to clear event callbacks");
+            }
+            m_client.Release();
+        }
+    } else if (m_client) {
+        std::lock_guard<std::mutex> engine_lk(dbg::Lock());
+        m_client.Release();
+    }
+
+    m_owner.Clear();
+    {
+        std::lock_guard<std::mutex> lk(m_owner_mu);
+        // Releasing the dedicated client on this same owner thread also
+        // removes its callback registration if the explicit clear failed.
+        m_uninstall_ok = true;
+        m_owner_cv.notify_all();
+    }
 }
 
 } // namespace windbgmcp::events

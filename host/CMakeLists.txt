@@ -5,12 +5,13 @@
 # Spawned by the AI client (Claude Code / Cursor / etc.). Talks two protocols:
 #
 #   stdin / stdout:           MCP JSON-RPC (with the AI client)
-#   \\.\pipe\windbgmcp:       our own length-prefixed JSON (with windbgmcpExt.dll)
+#   selected \\.\pipe\<name>: our own length-prefixed JSON (with mcpext.dll)
 #
 # Zero runtime dependencies besides Windows itself.
 
 add_executable(windbg-mcp WIN32
     src/main.cpp
+    src/app/options.cpp
     src/transport/pipe_client.cpp
     src/transport/frame_codec.cpp
     src/mcp/stdio_io.cpp

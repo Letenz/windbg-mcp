@@ -1,20 +1,23 @@
 // SPDX-License-Identifier: MIT
 //
-// Single-instance pipe server with overlapped I/O.
+// Per-endpoint pipe server with overlapped I/O.
 //
 //  - One named pipe instance, one connected client at a time.
 //  - Reader thread does overlapped ReadFile + WaitForMultipleObjects so it
 //    can be woken to send outgoing frames or to shut down.
-//  - Writer is synchronous (under a mutex). Outbound frames are short
-//    enough that this is fine; events and responses both go through Send.
+//  - Writers use overlapped I/O with a hard deadline and the server stop
+//    event. A peer that stops reading cannot pin a Router/publisher forever.
 //  - On disconnect we close the handle and re-listen.
 
 #pragma once
 
+#include "ipc/connection_fence.h"
 #include "ipc/frame_codec.h"
 
 #include <Windows.h>
 #include <atomic>
+#include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -25,51 +28,96 @@ namespace windbgmcp::ipc {
 // Callback the pipe server invokes when a complete payload arrives. Runs on
 // the reader thread; must not block (the router handler must dispatch to a
 // worker thread itself if heavy work is needed).
-using OnFrame = std::function<void(std::string payload)>;
+using OnFrame = std::function<void(std::string payload,
+                                   ConnectionGeneration generation)>;
 
 class PipeServer {
 public:
-    PipeServer();
+    explicit PipeServer(std::string endpoint);
     ~PipeServer();
 
     PipeServer(const PipeServer&) = delete;
     PipeServer& operator=(const PipeServer&) = delete;
 
-    // Start listening on \\.\pipe\windbgmcp. Returns false if another
+    // Start listening on the configured endpoint. Returns false if another
     // PipeServer instance (this process or otherwise) already owns it.
-    bool Start(OnFrame on_frame);
+    // greeting_payload, when non-empty, is the first frame emitted for every
+    // connection generation. Production uses it to pin the host to this
+    // exact bridge instance before any request is accepted.
+    bool Start(OnFrame on_frame, std::string greeting_payload = {});
 
     // Stop the server and wait for the reader thread to exit. Idempotent.
     void Stop();
 
     bool IsRunning() const noexcept { return m_running.load(); }
-    bool IsConnected() const noexcept { return m_connected.load(); }
+    bool IsConnected() const noexcept {
+        return m_fence.Current() != kNoConnectionGeneration;
+    }
+    const std::string& Endpoint() const noexcept { return m_endpoint; }
+    DWORD LastError() const noexcept { return m_last_error.load(); }
+    ConnectionGeneration CurrentGeneration() const noexcept {
+        return m_fence.Current();
+    }
+    bool IsCurrentGeneration(ConnectionGeneration generation) const noexcept {
+        return m_fence.Allows(generation);
+    }
 
     // Send a payload to the currently connected client. Returns false if no
     // client is connected or the write failed.
     bool Send(std::string_view payload);
 
+    // Generation-fenced send for request responses/chunks. Data from an old
+    // client can never land on a replacement connection.
+    bool Send(std::string_view payload, ConnectionGeneration generation);
+
+    // Write the terminal response for generation in full within a bounded
+    // deadline, then atomically fence that generation and stop
+    // accepting/reading connections. This is the only transport path used by
+    // wm_shutdown: teardown is scheduled only after this method succeeds.
+    // Named-pipe write completion is the commit point; this method never uses
+    // FlushFileBuffers because a non-reading peer can make that call unbounded.
+    bool SendFinal(std::string_view payload, ConnectionGeneration generation,
+                   std::int64_t request_id = 0);
+
 private:
     void Run();
     bool TryCreatePipe();
-    void HandleClient();
-    void Disconnect();
+    bool SendWithDeadline(std::string_view payload,
+                          ConnectionGeneration generation,
+                          bool allow_before_greeting);
+    void HandleClient(ConnectionGeneration generation);
+    bool HandleControlFrame(std::string_view payload,
+                            ConnectionGeneration generation);
+    void DisconnectClient(ConnectionGeneration generation);
+    void ClosePipe();
 
     std::atomic<bool>     m_running{false};
-    std::atomic<bool>     m_connected{false};
+    std::atomic<DWORD>    m_last_error{ERROR_SUCCESS};
+    ConnectionFence       m_fence;
+    std::atomic<ConnectionGeneration> m_ready_generation{
+        kNoConnectionGeneration};
+    std::string           m_endpoint;
+    std::wstring          m_endpoint_wide;
+    std::string           m_greeting_payload;
     OnFrame               m_on_frame;
     std::thread           m_thread;
 
-    // Pipe handle: valid between successful CreateNamedPipeW and Disconnect.
+    // The server handle remains open across client disconnects, retaining
+    // ownership of the endpoint until Stop() completes.
     HANDLE                m_pipe   = INVALID_HANDLE_VALUE;
     HANDLE                m_evt_stop = nullptr;   // manual-reset, signals Stop()
-    HANDLE                m_evt_send = nullptr;   // auto-reset, wakes reader to send
+    HANDLE                m_evt_final_ack = nullptr; // host consumed terminal resp
 
-    // Outbound frames are not actually queued at this layer — Send() just
-    // does a synchronous WriteFile under a mutex. The event above exists so
-    // the reader can be interrupted from its WaitForMultipleObjects when it
-    // needs to be torn down; we don't need to wake it for sends.
-    mutable std::mutex    m_write_mu;
+    // Outbound frames are not queued at this layer. Send() performs an
+    // overlapped WriteFile with a deadline under this mutex. It is timed so a
+    // terminal response is not stuck behind a backlog of ordinary writers.
+    // m_state_mu serializes connection publication/retirement and the short
+    // terminal-write reservation. It is never held while waiting on I/O.
+    mutable std::mutex    m_state_mu;
+    std::condition_variable m_state_cv;
+    ConnectionGeneration m_finalizing_generation = kNoConnectionGeneration;
+    std::int64_t          m_finalizing_request_id = 0;
+    mutable std::timed_mutex m_write_mu;
 
     Decoder               m_decoder;
 };

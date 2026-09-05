@@ -13,12 +13,12 @@
                   │  │ mcpext.dll                     │  │
                   │  │  - IDebugEventCallbacks 事件回调 │  │
                   │  │  - length-prefixed JSON 管道    │  │
-                  │  │  - 多 worker 线程异步分派        │  │
+                  │  │  - dbgeng 单线程串行请求通道     │  │
                   │  └──────────────┬─────────────────┘  │
                   └─────────────────┴────────────────────┘
-                                    │  \\.\pipe\windbgmcp
+                                    │  选定的 \\.\pipe\<name>
                                     │  - 4B 长度 + JSON 载荷
-                                    │  - req / resp / event / chunk
+                                    │  - hello / req / resp / ack / event / chunk
                                     │  - 单连接多路复用
                                     ▼
               ┌─────────────────────────────────────┐
@@ -26,7 +26,7 @@
               │  - 单异步连接                       │
               │  - request id → std::promise        │
               │  - 事件总线（含历史回放）            │
-              │  - 6 个 MCP 工具                    │
+              │  - 8 个 MCP 工具                    │
               └─────────────────────────────────────┘
                                     │
                                     ▼  stdio MCP (JSON-RPC)
@@ -44,7 +44,7 @@ CRT 全部静态链接，拷到任何 Windows 机器就能跑，**不需要装 V
 
 ## MCP 工具
 
-6 个工具，每个职责清晰单一。完整签名和示例工作流见 `docs/tools.md`。
+8 个工具，每个职责清晰单一。完整签名和示例工作流见 `docs/tools.md`。
 
 | 工具 | 用途 |
 |---|---|
@@ -53,7 +53,9 @@ CRT 全部静态链接，拷到任何 Windows 机器就能跑，**不需要装 V
 | `wm_wait_event` | 阻塞等待调试器事件（bugcheck、break、模块加载……），带 30 秒历史回放 |
 | `wm_break_in` | 发 `SetInterrupt`，再等 ext 自己的 break 事件——**不再轮询** |
 | `wm_analyze_crash` | 结构化 BSOD 报告：`!analyze -v` + `kb` + `lm` + `!drvobj` 解析成 JSON |
-| `wm_exit` | 断开 dbgeng 会话 |
+| `wm_detach` | 只 detach target，bridge 和 host 继续运行 |
+| `wm_shutdown` | response 发出后停止 bridge，不 detach target |
+| `wm_exit` | `wm_detach` 的弃用兼容别名 |
 
 ## 编译
 
@@ -111,9 +113,22 @@ windbgmcp: listening on \\.\pipe\windbgmcp
 ```
 
 辅助命令：
+
 - `!mcpext.status` 查看管道和连接状态
 - `!mcpext.stop` 停止管道
 - `!mcpext.help` 列出所有命令
+
+状态还会显示当前 connection generation 和 callback owner 线程。
+
+要给当前 WinDbg 实例分配独立 endpoint，可传短管道名或完整本地 endpoint：
+
+```text
+0: kd> !mcpext.start windbgmcp-project-a
+windbgmcp: listening on \\.\pipe\windbgmcp-project-a
+```
+
+名称只允许 ASCII 字母、数字、`.`、`_`、`-`，最长 240 字符。不带参数的
+调用仍兼容旧行为，使用 `\\.\pipe\windbgmcp`。
 
 ### 2. 在 AI 客户端注册 MCP server
 
@@ -124,9 +139,41 @@ claude mcp add --scope user windbg-mcp C:\tools\windbg-mcp\windbg-mcp.exe
 
 其他 MCP 客户端，把 `windbg-mcp.exe` 当成 stdio MCP server 配进去即可。
 
+host 必须选择与扩展相同的 endpoint。选择优先级依次为 `--pipe`、
+`WINDBGMCP_PIPE`、默认值：
+
+```powershell
+C:\tools\windbg-mcp\windbg-mcp.exe --pipe windbgmcp-project-a
+$env:WINDBGMCP_PIPE = "windbgmcp-project-a"
+C:\tools\windbg-mcp\windbg-mcp.exe
+```
+
+多个项目并行时，每个项目启动一组 WinDbg + 扩展 + MCP host，并给每组分配
+唯一管道名。每个 endpoint 仍只接收一个 host 连接。
+
+### 安全停止
+
+事件 sink 在专用 owner actor 中通过 `DebugCreate` 创建线程绑定的 dbgeng client。
+初始化必须异步进行：WinDbg 执行扩展命令时已持有内部 engine lock，如果此时等待
+另一个线程进入 dbgeng 会形成死锁。callback 使用非阻塞泵，并与串行 request lane
+共用 engine coordinator。远程只停止 bridge 时使用 `wm_shutdown`；卸载扩展或
+重启 target 前，也可以直接在 WinDbg 中执行 `!mcpext.stop`。
+`wm_run_cmd` 会拒绝 `!mcpext.*`、`.reboot`、`.unload` 和退出
+调试器命令，防止 MCP worker 尚在执行时同步卸载其代码。
+
+真正的安全边界是 `DebugExtensionCanUnload`：只要 lifecycle 尚未进入
+`Stopped`，或仍有 Router worker、callback actor、异步事件 publisher、teardown 活动，它就返回
+`S_FALSE`。`!mcpext.stop` 只在 lifecycle mutex 内转移状态和资源，随后调度
+reaper 并立即返回，避免在扩展命令持有 engine lock 时 join dbgeng 线程。reaper
+负责关闭管道、在 owner 线程卸载 callback、join request worker，最后发布
+`Stopped`。对于 `wm_shutdown`，扩展会在发起请求的 connection generation 上执行
+有界的 terminal response/host ACK 交换，再原子封闭该 generation，最后唤醒启动
+提交前已预建的 teardown executor。stdio MCP host 不会退出，但会固定到原 bridge
+instance；扩展重新启动后即使复用同名 endpoint，也要重启 host 才能显式绑定。
+
 ### 3. 让 AI 操作调试器
 
-AI 现在可以调用 6 个工具中的任意一个。典型的内核驱动调试流程大致是：
+AI 现在可以调用 8 个工具中的任意一个。典型的内核驱动调试流程大致是：
 
 ```python
 # 大致是 AI 视角下的调用：
@@ -143,13 +190,17 @@ report = wm_analyze_crash()                           # 拿到结构化 JSON
 
 ## 自动重连 / 生命周期
 
-`windbg-mcp.exe` 在下列场景**保持 AI 端 stdio 连接不掉线**：
+`windbg-mcp.exe` 对同一个扩展实例的偶发断线**保持 AI 端 stdio 连接不掉线**：
 
-- WinDbg 重启 —— 下一次工具调用自动重开命名管道
-- 内核 target `.reboot` —— `.reboot` 期间 dbgeng 会卸 `mcpext.dll`，等你重新 `.load mcpext + !mcpext.start` 后 host 自动接回去
 - 偶发管道断开 —— 所有等待中的请求立刻以 `disconnected` 失败，下一次请求触发重连
 
-host 进程只在 AI 客户端主动 kill 它（一般是关闭会话）或 stdin 关闭时退出。
+每次 `!mcpext.start` 都会在首帧 `hello` 中生成新的 `bridge_instance_id`。host 会固定
+首次看到的 ID；扩展重载、WinDbg 重启，或另一 WinDbg 复用同名 endpoint 时都会被
+拒绝。要绑定新实例，需显式重启 `windbg-mcp.exe`。
+
+每次连接都会获得单调递增的 generation。断线后，旧 generation 的排队任务会被
+丢弃，其 response/chunk 也不会发送给新 client。扩展在两个 client 之间持续持有
+同一个服务端 pipe handle，因此其他进程无法趁重连窗口抢占 endpoint。
 
 ## 线路协议
 
@@ -163,8 +214,9 @@ host 进程只在 AI 客户端主动 kill 它（一般是关闭会话）或 stdi
 +------------------+----------------------------+
 ```
 
-4 种帧：`req` / `resp` / `event` / `chunk`。请求通过 `id` 多路复用；事件异步推送。
-当前**仅支持单实例**——一台 Host 一个 WinDbg。完整规范和错误码列表见 `docs/protocol.md`。
+6 种帧：`hello` / `req` / `resp` / `ack` / `event` / `chunk`。请求通过 `id` 多路复用；事件异步推送。
+不同 WinDbg/host 组合使用唯一 endpoint 时可同时运行。完整规范和错误码列表见
+`docs/protocol.md`。
 
 ## 仓库结构
 
@@ -184,15 +236,17 @@ windbg-mcp/
 │   └── src/{transport,mcp,tools,analysis,util}
 └── tests/
     ├── ext/                      gtest：帧编解码、事件历史
-    └── host/                     gtest：帧编解码、bugcheck 解析、栈解析
+    └── host/                     gtest：帧编解码、解析器、endpoint/参数
 ```
 
 ## 状态
 
-v1.0。管道传输、事件推送、6 个工具、`.reboot` 生命周期已在真机内核调试会话
-（VirtualKD + WinDbg Preview）上验证通过。已知限制：
+v2.0。管道传输、事件推送、核心调试操作和 `.reboot` 生命周期已在真机内核调试
+会话（VirtualKD + WinDbg Preview）上验证通过。已知限制：
 
-- 仅支持单实例（一台 host 一个 WinDbg）；多实例支持作为协议未来扩展
+- 单个 WinDbg 内的请求在一个 dbgeng worker 上 FIFO 串行执行；这是为了遵守
+  `IDebugClient` 线程亲和性而做的取舍。长时间 `wm_wait_event` 会推迟同一
+  endpoint 上的后续请求；并行能力来自不同 endpoint
 - `wm_analyze_crash` 解析器基于 Windows 10/11 的 `!analyze -v` 输出开发；
   老版本可能需要补充解析规则
 

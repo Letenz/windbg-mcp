@@ -15,6 +15,7 @@
 // even when one frame would exceed kMaxFrameBytes.
 
 #include "handlers/handlers.h"
+#include "handlers/command_guard.h"
 
 #include "ipc/pipe_server.h"
 #include "util/debug_client.h"
@@ -96,7 +97,8 @@ std::string HeadTailTruncate(const std::string& s,
 
 // Send a chunk frame.
 void SendChunk(ipc::PipeServer& pipe, std::int64_t req_id, std::uint32_t seq,
-               bool eof, std::string_view chunk) {
+               bool eof, std::string_view chunk,
+               ipc::ConnectionGeneration generation) {
     json frame = {
         {"frame", "chunk"},
         {"id",    req_id},
@@ -104,11 +106,12 @@ void SendChunk(ipc::PipeServer& pipe, std::int64_t req_id, std::uint32_t seq,
         {"eof",   eof},
         {"chunk", chunk},
     };
-    pipe.Send(frame.dump());
+    pipe.Send(frame.dump(), generation);
 }
 
 void StreamToFile(ipc::PipeServer& pipe, std::int64_t req_id,
-                  const std::string& body, const std::string& path) {
+                  const std::string& body, const std::string& path,
+                  ipc::ConnectionGeneration generation) {
     // Write to disk, then chunk to the wire. The protocol guarantees the
     // server applies file writes in chunk-arrival order; since we send
     // everything before returning, ordering is trivially correct.
@@ -128,20 +131,27 @@ void StreamToFile(ipc::PipeServer& pipe, std::int64_t req_id,
         const std::size_t take = std::min(kChunkBytes, body.size() - off);
         const bool eof = (off + take) == body.size();
         SendChunk(pipe, req_id, seq++, eof,
-                  std::string_view(body.data() + off, take));
+                  std::string_view(body.data() + off, take), generation);
     }
     if (body.empty()) {
-        SendChunk(pipe, req_id, 0, true, "");
+        SendChunk(pipe, req_id, 0, true, "", generation);
     }
 }
 
 } // namespace
 
-json RunCmd(std::int64_t req_id, const json& args, ipc::PipeServer& pipe) {
+json RunCmd(std::int64_t req_id, const json& args, ipc::PipeServer& pipe,
+            ipc::ConnectionGeneration generation) {
     if (!args.contains("cmd") || !args["cmd"].is_string()) {
         throw HandlerError(err::kInvalidArg, "cmd is required and must be a string", "");
     }
     const std::string cmd = args["cmd"].get<std::string>();
+    if (const auto unsafe = UnsafeLifecycleCommand(cmd)) {
+        throw HandlerError(
+            err::kInvalidArg,
+            "lifecycle-changing command refused on the MCP worker: " + *unsafe,
+            "run !mcpext.stop in WinDbg, then issue the command directly there");
+    }
     const std::uint32_t timeout_ms =
         args.value("timeout_ms", static_cast<std::uint32_t>(kTimeoutStandardMs));
     const std::string output_file = args.value("output_file", std::string{});
@@ -248,7 +258,7 @@ json RunCmd(std::int64_t req_id, const json& args, ipc::PipeServer& pipe) {
 
     // Streaming branch.
     if (!output_file.empty()) {
-        StreamToFile(pipe, req_id, utf8, output_file);
+        StreamToFile(pipe, req_id, utf8, output_file, generation);
         std::string preview = HeadTailTruncate(utf8, preview_head, kPreviewTail);
         return json{
             {"output",                preview},

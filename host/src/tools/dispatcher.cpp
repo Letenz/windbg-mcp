@@ -90,7 +90,9 @@ json Dispatcher::Descriptors() const {
         tool("wm_wait_event",    "Block until a debugger event arrives. Pass since_ms to replay the last 30s of matching events.", wait_event_schema),
         tool("wm_break_in",      "Halt a running target via SetInterrupt; waits on the ext's break event.", break_in_schema),
         tool("wm_analyze_crash", "Structured BSOD report: !analyze -v + kb + lm + !drvobj, parsed.", analyze_schema),
-        tool("wm_exit",          "Detach the dbgeng session.", empty),
+        tool("wm_detach",        "Detach the debugger target only; keep the bridge and host running.", empty),
+        tool("wm_shutdown",      "Stop the WinDbg bridge after delivering the response; keep the target attached and MCP host running.", empty),
+        tool("wm_exit",          "Deprecated alias for wm_detach; it does not stop the bridge or WinDbg.", empty),
     });
 }
 
@@ -100,6 +102,8 @@ Result Dispatcher::Call(const std::string& name, const json& args) {
     if (name == "wm_wait_event")     return CallWaitEvent(args);
     if (name == "wm_break_in")       return CallBreakIn(args);
     if (name == "wm_analyze_crash")  return AnalyzeCrash(m_pipe, args);
+    if (name == "wm_detach")         return CallDetach(args);
+    if (name == "wm_shutdown")       return CallShutdown(args);
     if (name == "wm_exit")           return CallExit(args);
     return ErrJson("invalid_arg", "unknown tool: " + name, "see tools/list");
 }
@@ -144,6 +148,16 @@ Result Dispatcher::CallBreakIn(const json& args) {
     if (timeout_ms <= 0) return ErrJson("invalid_arg", "timeout_ms must be > 0");
     auto resp = m_pipe.Request("break_in", {{"timeout_ms", timeout_ms}},
                                static_cast<std::uint32_t>(timeout_ms) + 5000);
+    return FromResponse(resp);
+}
+
+Result Dispatcher::CallDetach(const json& /*args*/) {
+    auto resp = m_pipe.Request("detach", json::object(), 5000);
+    return FromResponse(resp);
+}
+
+Result Dispatcher::CallShutdown(const json& /*args*/) {
+    auto resp = m_pipe.Request("shutdown", json::object(), 5000);
     return FromResponse(resp);
 }
 

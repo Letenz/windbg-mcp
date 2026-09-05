@@ -1,13 +1,15 @@
 # MCP tool surface
 
-Six tools, each with a single clear purpose. The AI's mental model:
+Eight tools, each with a single clear purpose. The AI's mental model:
 
 1. **Is something there?** → `wm_session`
 2. **Run a WinDbg command.** → `wm_run_cmd`
 3. **Wait for something to happen.** → `wm_wait_event`
 4. **Halt a running target.** → `wm_break_in`
 5. **Got a BSOD — analyse it.** → `wm_analyze_crash`
-6. **Shut down.** → `wm_exit`
+6. **Detach the target but keep the bridge.** → `wm_detach`
+7. **Stop the bridge but keep the target.** → `wm_shutdown`
+8. **Support an old client.** → `wm_exit` (deprecated alias for `wm_detach`)
 
 All tools return a JSON-serialised result inside the MCP `tools/call`
 response. The host's worker thread blocks on the pipe with the
@@ -34,11 +36,25 @@ target you're attached to.
   "thread_id":     4,
   "bugcheck":      null,            // or {code, name, params, ip, faulting_module}
   "modules_count": 324,
-  "ext_version":   "1.0.0"
+  "pipe_endpoint": "\\\\.\\pipe\\windbgmcp-project-a",
+  "connection_generation": 7,
+  "engine_lane":   "serial",
+  "ext_version":   "2.0.0"
 }
 ```
 
 **Failure modes:** `disconnected`.
+
+`pipe_endpoint` is useful when diagnosing a multi-project setup: it confirms
+which extension instance answered. `connection_generation` confirms which
+host connection produced the response and increases after every reconnect.
+`engine_lane="serial"` means requests for this WinDbg instance execute FIFO on
+one thread; separate endpoints can run in parallel.
+
+For a live target whose `exec_status` is running, `wm_session` deliberately
+does not query registers, the current thread, modules, or bugcheck memory over
+KD. In that state `ip`, `thread_id`, and `modules_count` are zero and
+`bugcheck` is `null`; call `wm_break_in` before requesting detailed context.
 
 **Typical use:** after starting the harness, before driving any guest action,
 poll once to confirm the ext is alive and find out if the previous run left
@@ -103,6 +119,10 @@ and newlines are encoded by the JSON layer. Do not double-escape. To run
 
 **Failure modes:** `not_attached`, `target_running` (if the command requires
 break state — most do), `timeout`, `engine_error`, `invalid_arg`.
+
+Lifecycle-changing commands are intentionally not raw passthrough operations.
+`!mcpext.*`, `.reboot`, `.unload`, and debugger quit commands return
+`invalid_arg`; stop the bridge in WinDbg and issue those commands directly.
 
 ---
 
@@ -279,16 +299,93 @@ if ev["kind"] == "bugcheck":
 
 ---
 
-## `wm_exit`
+## `wm_detach`
 
-Detach the debugger and shut down the ext's pipe server. WinDbg's UI is left
-intact (closing the GUI is the human's job).
+Detach the debugger target only. The extension pipe, MCP host, and WinDbg UI
+remain running. This operation does not mean “shut down the bridge.”
 
 **Args:** none.
 
-**Returns:** `{ "ok": true }`.
+**Returns:**
 
-**Failure modes:** `disconnected` (already gone — treat as success).
+```jsonc
+{
+  "ok": true,
+  "semantic": "detach_target_only",
+  "target_detached": true,
+  "target_kind": "kernel",
+  "detach_api": "IDebugClient::EndSession(DEBUG_END_ACTIVE_DETACH)",
+  "bridge_state": "running",
+  "connection_generation": 7
+}
+```
+
+**Failure modes:** `not_attached`, `engine_error`, `disconnected`. A failed
+dbgeng detach is reported rather than converted into a false success.
+User targets use `DetachProcesses`; kernel targets use
+`EndSession(DEBUG_END_ACTIVE_DETACH)`. An image/dump session is passively
+closed and returns `target_kind="image_file"` with `target_detached=false`.
+
+---
+
+## `wm_shutdown`
+
+Stop the WinDbg extension bridge only. It does not detach, resume, terminate,
+or otherwise change the target, and it does not close WinDbg or terminate the
+stdio `windbg-mcp.exe` host.
+
+**Args:** none.
+
+**Returns:**
+
+```jsonc
+{
+  "ok": true,
+  "semantic": "bridge_shutdown_only",
+  "target_detached": false,
+  "bridge_state": "stopping_after_response",
+  "host_state": "running",
+  "connection_generation": 7
+}
+```
+
+The success response is a terminal response for its connection generation.
+The extension writes the complete length-prefixed response with a deadline and
+waits for the host reader's bounded ACK, then fences that exact generation and
+wakes a teardown executor prepared before startup committed. A stale
+request from an older generation cannot shut down a replacement connection,
+and the Router worker never joins itself or performs callback cleanup on its
+dbgeng request stack.
+
+Once the host has returned the MCP result, the named pipe disconnects. The
+host stays alive but is pinned to the original `bridge_instance_id`; later
+tool calls return `disconnected`. After a deliberate extension restart,
+restart `windbg-mcp.exe` to bind the new instance even when the endpoint name
+is unchanged. Requests queued behind `wm_shutdown` are failed as
+`disconnected`; do not enqueue work after it.
+
+**Failure modes:** `disconnected`. If the final response cannot be written and
+ACKed on the requesting generation, teardown is deliberately suppressed.
+
+---
+
+## `wm_exit` (deprecated)
+
+Compatibility alias for `wm_detach`. It does **not** stop the bridge or close
+WinDbg. New callers must use the explicit operation that matches their intent.
+
+**Args:** none.
+
+**Returns:** the `wm_detach` result plus:
+
+```jsonc
+{
+  "deprecated": true,
+  "replacement": "wm_detach"
+}
+```
+
+**Failure modes:** the same as `wm_detach`.
 
 ---
 

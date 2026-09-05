@@ -12,7 +12,8 @@ namespace windbgmcp::handlers {
 using nlohmann::json;
 using ipc::HandlerError;
 
-json WaitEvent(std::int64_t /*req_id*/, const json& args, ipc::PipeServer& /*pipe*/) {
+json WaitEvent(std::int64_t /*req_id*/, const json& args, ipc::PipeServer& /*pipe*/,
+               ipc::ConnectionGeneration /*generation*/) {
     if (!args.contains("kinds") || !args["kinds"].is_array()) {
         throw HandlerError(err::kInvalidArg, "kinds must be a non-empty array of strings", "");
     }

@@ -9,14 +9,23 @@
 
 namespace windbgmcp::handlers {
 
-nlohmann::json Session(std::int64_t req_id, const nlohmann::json& args, ipc::PipeServer& pipe);
-nlohmann::json RunCmd (std::int64_t req_id, const nlohmann::json& args, ipc::PipeServer& pipe);
-nlohmann::json BreakIn(std::int64_t req_id, const nlohmann::json& args, ipc::PipeServer& pipe);
-nlohmann::json Exit   (std::int64_t req_id, const nlohmann::json& args, ipc::PipeServer& pipe);
+nlohmann::json Session(std::int64_t req_id, const nlohmann::json& args,
+                       ipc::PipeServer& pipe, ipc::ConnectionGeneration generation);
+nlohmann::json RunCmd (std::int64_t req_id, const nlohmann::json& args,
+                       ipc::PipeServer& pipe, ipc::ConnectionGeneration generation);
+nlohmann::json BreakIn(std::int64_t req_id, const nlohmann::json& args,
+                       ipc::PipeServer& pipe, ipc::ConnectionGeneration generation);
+nlohmann::json Detach (std::int64_t req_id, const nlohmann::json& args,
+                       ipc::PipeServer& pipe, ipc::ConnectionGeneration generation);
+nlohmann::json Shutdown(std::int64_t req_id, const nlohmann::json& args,
+                        ipc::PipeServer& pipe, ipc::ConnectionGeneration generation);
+nlohmann::json Exit   (std::int64_t req_id, const nlohmann::json& args,
+                       ipc::PipeServer& pipe, ipc::ConnectionGeneration generation);
 
 // wait_event lives in router-land too because it just blocks on the
 // publisher; we declare it here for symmetry.
-nlohmann::json WaitEvent(std::int64_t req_id, const nlohmann::json& args, ipc::PipeServer& pipe);
+nlohmann::json WaitEvent(std::int64_t req_id, const nlohmann::json& args,
+                         ipc::PipeServer& pipe, ipc::ConnectionGeneration generation);
 
 void RegisterAll(ipc::Router& router);
 

@@ -21,8 +21,11 @@ DEBUG_EVENT_CHANGE_ENGINE_STATE        // for DEBUG_CES_EXECUTION_STATUS
 
 All callbacks return `DEBUG_STATUS_NO_CHANGE`. They never set execution
 status, never wait, never block. Each callback marshals the relevant fields
-into a JSON event and hands it off to the publisher thread, which writes the
-frame on the pipe and appends it to the in-process history ring.
+into a JSON event, records it in the in-process history ring/notifies waiters,
+and makes a non-blocking enqueue to a dedicated pipe publisher. The wire queue
+is capped at 256 frames and drops the newest event when full; `wm_session`
+reports the cumulative count as `event_queue_dropped`. History replay and
+in-process `wm_wait_event` delivery are retained even when a wire push drops.
 
 ## History replay
 
@@ -89,9 +92,10 @@ Field notes:
 
 - `name` is resolved from a static built-in table (no symbols needed). If
   unknown (e.g. driver-specific bugchecks), `name` is the string `"UNKNOWN"`.
-- `faulting_module` is resolved by `IDebugSymbols::GetModuleByOffset` over
-  the bugcheck `ip`. If `ip` is unmapped or outside any module, the field is
-  `null` (e.g. wild jumps).
+- `ip` comes directly from the exception callback. `faulting_module` is
+  `null` and `thread_id` is `0` in the push event because dbgeng can deliver
+  callbacks on a thread other than the dedicated client's creator thread.
+  Use `wm_analyze_crash` or a broken-target `wm_session` for enriched context.
 - This event fires **once per bugcheck**. A second bugcheck within the same
   session (rare; usually the target is dead) emits another event.
 
@@ -114,6 +118,9 @@ state-change is suppressed to avoid double-fires).
 `reason` is best-effort and inferred from the immediately preceding callback:
 a `Breakpoint` callback before the state change → `"breakpoint"`; a non-zero
 `SetInterrupt` flag → `"interrupt"`; etc. When the cause is unclear, `"other"`.
+The generic `ChangeEngineState` callback does not carry register or thread
+context, so `ip` and `thread_id` are zero; call `wm_session` after the break for
+those values. A `breakpoint_hit` event still includes the breakpoint address.
 
 ### `breakpoint_hit` — specific breakpoint fired
 

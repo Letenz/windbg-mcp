@@ -9,11 +9,19 @@
 //      Dispatcher which talks to the pipe.
 //   4. When stdin closes, exit.
 
+#include "app/options.h"
 #include "mcp/jsonrpc_server.h"
 #include "mcp/stdio_io.h"
 #include "tools/dispatcher.h"
 #include "transport/pipe_client.h"
 #include "util/log.h"
+
+#include "windbgmcp/protocol.h"
+
+#include <cstdlib>
+#include <iostream>
+#include <string>
+#include <vector>
 
 int main(int argc, char* argv[]) {
 #if defined(WINDBGMCP_LOG_ENABLED)
@@ -24,9 +32,31 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
-    (void)argc; (void)argv;
+    std::vector<std::string> args;
+    args.reserve(argc > 1 ? static_cast<std::size_t>(argc - 1) : 0);
+    for (int i = 1; i < argc; ++i) args.emplace_back(argv[i]);
 
-    wmh::transport::PipeClient pipe;
+    char* raw_env_pipe = nullptr;
+    std::size_t raw_env_size = 0;
+    const errno_t env_result = ::_dupenv_s(
+        &raw_env_pipe, &raw_env_size, windbgmcp::kPipeEnvironmentVariable);
+    const std::string env_pipe =
+        env_result == 0 && raw_env_pipe ? raw_env_pipe : std::string{};
+    std::free(raw_env_pipe);
+
+    const auto options = wmh::app::ParseOptions(
+        args, env_pipe.empty() ? nullptr : env_pipe.c_str());
+    if (!options.ok) {
+        std::cerr << "windbg-mcp: " << options.error << "\n"
+                  << wmh::app::UsageText();
+        return 2;
+    }
+    if (options.show_help) {
+        std::cout << wmh::app::UsageText();
+        return 0;
+    }
+
+    wmh::transport::PipeClient pipe(options.options.pipe_endpoint);
     wmh::tools::Dispatcher     disp(pipe);
     wmh::mcp::StdioServer      io;
     wmh::mcp::JsonRpcServer    rpc(io, disp);

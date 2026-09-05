@@ -8,6 +8,8 @@ void RegisterAll(ipc::Router& router) {
     router.Register("run_cmd",    &RunCmd);
     router.Register("wait_event", &WaitEvent);
     router.Register("break_in",   &BreakIn);
+    router.Register("detach",     &Detach);
+    router.Register("shutdown",   &Shutdown);
     router.Register("exit",       &Exit);
 }
 

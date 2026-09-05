@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //
-// Tool dispatcher. Owns the PipeClient and the 6 MCP tools. Each tool
+// Tool dispatcher. Owns the PipeClient and the 8 MCP tools. Each tool
 // translates MCP `tools/call` arguments into one or more pipe requests,
 // then formats the result as a UTF-8 string that the MCP client receives.
 //
@@ -41,6 +41,8 @@ private:
     Result CallWaitEvent  (const nlohmann::json& args);
     Result CallBreakIn    (const nlohmann::json& args);
     Result CallAnalyzeCrash(const nlohmann::json& args);
+    Result CallDetach     (const nlohmann::json& args);
+    Result CallShutdown   (const nlohmann::json& args);
     Result CallExit       (const nlohmann::json& args);
 
     transport::PipeClient& m_pipe;

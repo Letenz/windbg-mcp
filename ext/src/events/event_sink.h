@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //
-// IDebugEventCallbacks implementation. Registered on the process-wide
-// IDebugClient (windbgmcp::dbg::Get) when the extension starts. Every
+// IDebugEventCallbacks implementation. !mcpext.start launches a dedicated
+// owner actor asynchronously; after the bang command returns, that actor
+// creates its own thread-bound client and registers callbacks on it. Every
 // callback marshals the relevant fields into a windbgmcp::events::Event and
 // hands it to the Publisher; all callbacks return DEBUG_STATUS_NO_CHANGE so
 // they never alter execution status (so WinDbg's UI behaviour is intact).
@@ -15,15 +16,34 @@
 
 #pragma once
 
+#include "lifecycle/thread_affinity.h"
+
 #include <DbgEng.h>
 #include <atlbase.h>
 #include <atomic>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <thread>
+#include <utility>
 
 namespace windbgmcp::events {
 
 class EventSink : public IDebugEventCallbacks {
 public:
-    static EventSink* Create();
+    using ClientFactory = std::function<HRESULT(IDebugClient**)>;
+
+    enum class InstallState {
+        NotStarted,
+        Installing,
+        Installed,
+        Failed,
+        Stopped,
+    };
+
+    // client_factory is a test seam. Production callers leave it empty and
+    // the callback-owner thread creates its own client with DebugCreate.
+    static EventSink* Create(ClientFactory client_factory = {});
 
     // IUnknown
     STDMETHOD(QueryInterface)(REFIID iid, PVOID* iface) override;
@@ -51,14 +71,38 @@ public:
     STDMETHOD(ChangeEngineState)(ULONG flags, ULONG64 argument) override;
     STDMETHOD(ChangeSymbolState)(ULONG flags, ULONG64 argument) override;
 
-    // Hook into the process-wide IDebugClient. Returns false on failure.
-    bool Install();
-    void Uninstall();
+    // Start a dedicated callback-owner thread and return as soon as the
+    // thread has been created. Initialization must remain asynchronous:
+    // !mcpext.start executes while WinDbg owns an internal engine lock, so
+    // waiting here for DebugCreate/SetEventCallbacks would deadlock with the
+    // new thread. The actor creates, uses, and releases its client itself.
+    bool InstallAsync();
+    InstallState State() const noexcept { return m_install_state.load(); }
+    const char* StateText() const noexcept;
+
+    // Signal and join the callback-owner thread. SetEventCallbacks(nullptr)
+    // and IDebugClient::Release both execute inside that owner thread.
+    bool Uninstall();
+    bool IsOwnerThread() const noexcept;
+    DWORD OwnerThreadId() const noexcept { return m_owner.OwnerThreadId(); }
 
 private:
-    EventSink() = default;
+    explicit EventSink(ClientFactory client_factory)
+        : m_client_factory(std::move(client_factory)) {}
+    ~EventSink() = default;
+    void OwnerLoop();
 
     std::atomic<ULONG> m_ref{1};
+    // Only the owner actor accesses m_client.
+    CComPtr<IDebugClient> m_client;
+    ClientFactory m_client_factory;
+    lifecycle::ThreadAffinity m_owner;
+    std::thread m_owner_thread;
+    std::mutex m_owner_mu;
+    std::condition_variable m_owner_cv;
+    std::atomic<InstallState> m_install_state{InstallState::NotStarted};
+    bool m_stop_requested = false;
+    bool m_uninstall_ok = false;
 
     // Last seen exec status, used by ChangeEngineState to compute "from".
     std::atomic<ULONG> m_last_status{DEBUG_STATUS_NO_CHANGE};

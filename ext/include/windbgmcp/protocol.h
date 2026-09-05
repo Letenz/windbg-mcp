@@ -6,15 +6,26 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace windbgmcp {
 
 // On-the-wire protocol version. Bump only on a breaking change.
-inline constexpr int kProtocolVersion = 1;
+inline constexpr int kProtocolVersion = 2;
 
-// Pipe name. Fixed for v1 (single-instance only).
+// Default local named-pipe endpoint. A session may select a different
+// endpoint at startup; the current wire format is protocol v2.
+inline constexpr char    kDefaultPipeEndpoint[]     = "\\\\.\\pipe\\windbgmcp";
+inline constexpr wchar_t kDefaultPipeEndpointWide[] = L"\\\\.\\pipe\\windbgmcp";
+inline constexpr char    kPipeEndpointPrefix[]      = "\\\\.\\pipe\\";
+
+// Backward-compatible source alias for v1 consumers. New code should use
+// kDefaultPipeEndpointWide because the endpoint is no longer globally fixed.
 inline constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\windbgmcp";
+
+// Host-side environment fallback. Command-line --pipe takes precedence.
+inline constexpr char kPipeEnvironmentVariable[] = "WINDBGMCP_PIPE";
 
 // Single-frame hard cap. Anything larger is a protocol error.
 inline constexpr std::uint32_t kMaxFrameBytes = 16u * 1024u * 1024u;

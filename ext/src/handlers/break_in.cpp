@@ -25,7 +25,8 @@ namespace windbgmcp::handlers {
 using nlohmann::json;
 using ipc::HandlerError;
 
-json BreakIn(std::int64_t /*req_id*/, const json& args, ipc::PipeServer& /*pipe*/) {
+json BreakIn(std::int64_t /*req_id*/, const json& args, ipc::PipeServer& /*pipe*/,
+             ipc::ConnectionGeneration /*generation*/) {
     const std::uint32_t timeout_ms =
         args.value("timeout_ms", static_cast<std::uint32_t>(kTimeoutStandardMs));
 
@@ -59,17 +60,18 @@ json BreakIn(std::int64_t /*req_id*/, const json& args, ipc::PipeServer& /*pipe*
 
     // Issue the interrupt request from a fresh client to avoid touching
     // the engine's owning client.
-    CComPtr<IDebugClient> req_client;
-    HRESULT hr = ::DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(&req_client));
-    if (FAILED(hr)) {
-        throw HandlerError(err::kEngineError, "DebugCreate (interrupt) failed", "", hr);
-    }
-    CComQIPtr<IDebugControl> req_ctl(req_client);
-    if (!req_ctl) {
-        throw HandlerError(err::kEngineError, "QI IDebugControl (interrupt) failed", "");
-    }
+    HRESULT hr = E_FAIL;
     {
         std::lock_guard<std::mutex> engine_lk(dbg::Lock());
+        CComPtr<IDebugClient> req_client;
+        hr = ::DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(&req_client));
+        if (FAILED(hr)) {
+            throw HandlerError(err::kEngineError, "DebugCreate (interrupt) failed", "", hr);
+        }
+        CComQIPtr<IDebugControl> req_ctl(req_client);
+        if (!req_ctl) {
+            throw HandlerError(err::kEngineError, "QI IDebugControl (interrupt) failed", "");
+        }
         hr = req_ctl->SetInterrupt(DEBUG_INTERRUPT_ACTIVE);
     }
     if (FAILED(hr)) {

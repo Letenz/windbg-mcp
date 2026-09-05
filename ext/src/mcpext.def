@@ -3,6 +3,7 @@ LIBRARY mcpext
 EXPORTS
     DebugExtensionInitialize
     DebugExtensionUninitialize
+    DebugExtensionCanUnload
     DebugExtensionNotify
     start    @1
     stop     @2

@@ -2,6 +2,10 @@ add_executable(host_unittests
     bugcheck_parser_test.cpp
     stack_parser_test.cpp
     frame_codec_test.cpp
+    pipe_endpoint_test.cpp
+    options_test.cpp
+    pipe_client_lifecycle_test.cpp
+    dispatcher_test.cpp
 )
 
 target_link_libraries(host_unittests
@@ -14,6 +18,13 @@ target_sources(host_unittests PRIVATE
     ${CMAKE_SOURCE_DIR}/host/src/analysis/bugcheck_parser.cpp
     ${CMAKE_SOURCE_DIR}/host/src/analysis/stack_parser.cpp
     ${CMAKE_SOURCE_DIR}/host/src/transport/frame_codec.cpp
+    ${CMAKE_SOURCE_DIR}/host/src/transport/pipe_client.cpp
+    ${CMAKE_SOURCE_DIR}/host/src/app/options.cpp
+    ${CMAKE_SOURCE_DIR}/host/src/tools/dispatcher.cpp
+    ${CMAKE_SOURCE_DIR}/host/src/tools/run_cmd.cpp
+    ${CMAKE_SOURCE_DIR}/host/src/tools/analyze_crash.cpp
+    ${CMAKE_SOURCE_DIR}/host/src/util/log.cpp
+    ${CMAKE_SOURCE_DIR}/host/src/util/path.cpp
 )
 target_include_directories(host_unittests PRIVATE
     ${CMAKE_SOURCE_DIR}/host/src

@@ -5,7 +5,7 @@
 //
 //   initialize           -> negotiate protocol version, advertise tools cap
 //   notifications/*      -> ignore (we don't ever notify; we only respond)
-//   tools/list           -> return our six tool descriptors
+//   tools/list           -> return our eight tool descriptors
 //   tools/call           -> dispatch to ToolDispatcher
 //
 // Anything else gets a JSON-RPC method_not_found error.

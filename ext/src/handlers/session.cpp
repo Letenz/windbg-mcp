@@ -2,6 +2,7 @@
 #include "handlers/handlers.h"
 
 #include "events/publisher.h"
+#include "ipc/pipe_server.h"
 #include "util/debug_client.h"
 #include "util/status.h"
 #include "windbgmcp/protocol.h"
@@ -43,7 +44,8 @@ const char* TargetKind() {
 
 } // namespace
 
-json Session(std::int64_t /*req_id*/, const json& /*args*/, ipc::PipeServer& /*pipe*/) {
+json Session(std::int64_t /*req_id*/, const json& /*args*/, ipc::PipeServer& pipe,
+             ipc::ConnectionGeneration generation) {
     auto client = dbg::Get();
     if (!client) {
         throw HandlerError(err::kEngineError, "DebugCreate failed", "restart WinDbg");
@@ -66,7 +68,10 @@ json Session(std::int64_t /*req_id*/, const json& /*args*/, ipc::PipeServer& /*p
 
     ULONG64 ip = 0;
     ULONG tid = 0;
-    if (attached) {
+    // Register/thread queries can issue KD traffic and may block indefinitely
+    // while a live target is running. A liveness probe must stay cheap in
+    // that state; detailed context is collected after wm_break_in.
+    if (attached && !status::IsRunning(exec)) {
         if (CComQIPtr<IDebugRegisters2> regs(client); regs) {
             regs->GetInstructionOffset(&ip);
         }
@@ -113,7 +118,12 @@ json Session(std::int64_t /*req_id*/, const json& /*args*/, ipc::PipeServer& /*p
         {"thread_id",     tid},
         {"bugcheck",      bugcheck},
         {"modules_count", mod_loaded},
-        {"ext_version",   "1.0.0"},
+        {"pipe_endpoint", pipe.Endpoint()},
+        {"connection_generation", generation},
+        {"event_queue_dropped",
+         events::Publisher::Get().DroppedEvents()},
+        {"engine_lane",   "serial"},
+        {"ext_version",   "2.0.0"},
     };
 }
 

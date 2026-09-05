@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
 //
-// Owns the process-wide IDebugClient that the extension uses for everything
-// that runs OUTSIDE a WinDbg-issued callback (event sink registration,
-// session queries, break_in interrupts). Handlers that *are* inside a
-// WinDbg callback (the way `mcpext_start` is called) get the client passed
-// in directly by WinDbg.
+// Owns the request lane's IDebugClient. The router executes every dbgeng
+// handler on one stable worker thread; Get() creates the client there and
+// refuses to hand the same COM object to any other thread. WinDbg event
+// callbacks use the client passed to !mcpext.start instead.
 //
-// Lifetime: created on first call to Get(), released by Reset().
+// Lifetime: created on first request-lane call to Get(), then released by
+// Reset() on that same worker when the router stops.
 //
 // dbgeng serialisation: dbgeng's kernel-debug transport (KD packets) can
 // only be used by one caller at a time. Concurrent KD-touching calls
@@ -23,11 +23,11 @@
 
 namespace windbgmcp::dbg {
 
-// Returns a process-wide IDebugClient. Lazily created. Thread-safe.
-// May return nullptr if DebugCreate failed (extremely rare).
+// Returns the request lane's lazily-created IDebugClient. Returns nullptr if
+// DebugCreate failed or a caller violates the lane's thread affinity.
 CComPtr<IDebugClient> Get();
 
-// Drop the cached client. Call from extension teardown only.
+// Drop the cached client. Must be called from its owning request thread.
 void Reset();
 
 // Process-wide mutex serialising all dbgeng/KD-touching calls. Take it

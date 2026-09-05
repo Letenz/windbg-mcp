@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //
-// Multiplexed client to \\.\pipe\windbgmcp.
+// Multiplexed client to one configured per-session named-pipe endpoint.
 //
 // Design:
 //
@@ -58,6 +58,7 @@ using EventHandler = std::function<void(const nlohmann::json& event_frame)>;
 class PipeClient {
 public:
     PipeClient();
+    explicit PipeClient(std::string pipe_endpoint);
     ~PipeClient();
 
     PipeClient(const PipeClient&) = delete;
@@ -69,6 +70,8 @@ public:
     bool EnsureConnected(std::uint32_t timeout_ms = 5'000);
 
     bool IsConnected() const noexcept { return m_connected.load(); }
+    bool IsClosed() const noexcept { return m_closed.load(); }
+    const std::string& Endpoint() const noexcept { return m_endpoint; }
 
     void Close();
 
@@ -93,22 +96,39 @@ private:
         ChunkSink                   sink;
     };
 
-    void ReaderLoop();
+    void ReaderLoop(std::uint64_t generation);
     void Dispatch(const std::string& payload);
-    void Fail(Pending* slot, const Error& err);
+    bool AcknowledgeTerminal(std::int64_t request_id);
     void FailAllPending(const std::string& reason);
+    bool ResetConnectionLocked(); // requires m_conn_mu; false on reader self-call
+    bool EnsurePinnedIdentity(std::uint64_t generation,
+                              std::chrono::steady_clock::time_point deadline,
+                              std::string& error);
 
     HANDLE                              m_pipe{INVALID_HANDLE_VALUE};
+    std::string                         m_endpoint;
+    std::wstring                        m_endpoint_wide;
     HANDLE                              m_stop_evt{nullptr};   // signal Close()
     std::atomic<bool>                   m_connected{false};
     std::atomic<bool>                   m_running{false};
+    std::atomic<bool>                   m_closed{false};
+    std::atomic<std::uint64_t>          m_generation_counter{0};
+    std::atomic<std::uint64_t>          m_active_generation{0};
     std::thread                         m_reader;
     std::mutex                          m_conn_mu;    // serialises connect/disconnect
-    std::mutex                          m_write_mu;
+    std::timed_mutex                    m_write_mu;
     Decoder                             m_decoder;
 
+    // The extension sends a server-first hello on every physical
+    // connection. The first bridge instance is pinned for this host process;
+    // reconnecting the same endpoint is accepted only for that same instance.
+    std::mutex                          m_identity_mu;
+    std::condition_variable             m_identity_cv;
+    std::string                         m_observed_instance_id;
+    std::string                         m_pinned_instance_id;
+
     std::mutex                          m_pending_mu;
-    std::map<std::int64_t, std::unique_ptr<Pending>> m_pending;
+    std::map<std::int64_t, std::shared_ptr<Pending>> m_pending;
     std::atomic<std::int64_t>           m_next_id{1};
 
     std::mutex                          m_subs_mu;
