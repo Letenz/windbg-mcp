@@ -64,24 +64,36 @@ the target in a bugcheck state.
 
 ## `wm_run_cmd`
 
-Raw passthrough to `IDebugControl::Execute`. Whatever the AI types here is
-what dbgeng sees, byte-for-byte after JSON decoding.
+Execute UTF-8 WinDbg commands through `IDebugControl4::ExecuteWide`.
+Top-level semicolons or actual newlines separate up to 64 sequential commands.
+Quotes, expressions and control blocks stay intact. Inside a block, use normal
+WinDbg semicolons; line-owning aliases, scripts and `*` comments retain their
+native semantics. This is not a shell or a sandbox for arbitrary scripts.
 
 **Args:**
 
 | name           | type | default | meaning |
 |----------------|------|---------|---------|
-| `cmd`          | str  | —       | the WinDbg command. Multiple commands separated by `\n`. |
-| `timeout_ms`   | int  | 30000   | hard ceiling. 5000 / 30000 / 120000 are the recommended tiers. |
-| `output_file`  | str  | —       | absolute path; if set, output is streamed to disk and only a preview is returned. |
-| `preview_bytes`| int  | 8192    | head bytes in the preview; tail is always 2048. |
+| `cmd`          | str  | —       | WinDbg command or top-level command batch; not an array or Markdown fence. |
+| `timeout_ms`   | int  | 30000   | budget from 1 to 120000 ms; not hard cancellation of an in-flight command. |
+| `output_file`  | str  | —       | absolute local path; the extension writes the full UTF-8 output, including partial failure output, after execution. |
+| `preview_bytes`| int  | 8192    | head bytes, from 0 to 1048576; tail is 2048, aligned to UTF-8 boundaries. |
 
 **Returns (success):**
 
 ```jsonc
 {
+  "ok":                   true,
+  "commands_total":       2,
+  "commands_executed":    2,
+  "commands_skipped":     0,
+  "results": [
+    {"index": 0, "command": ".echo A", "status": "succeeded", "output": "A\n"},
+    {"index": 1, "command": ".echo B", "status": "succeeded", "output": "B\n"}
+  ],
   "output":               "...",          // head + tail with [...truncated N bytes...]
   "output_file":          "F:/...",       // only when caller set it
+  "output_file_written":  true,           // only when caller set output_file
   "bytes_total":          123456,
   "truncated_in_response": true,          // false if full body fits and no file requested
   "exec_status_after":    "BREAK"
@@ -90,8 +102,32 @@ what dbgeng sees, byte-for-byte after JSON decoding.
 
 When the full body is ≤ 256 KiB and no `output_file` was requested, `output`
 contains the whole thing and `truncated_in_response = false`. Above that
-threshold, the response is forcibly truncated to head 8 KiB + tail 2 KiB and
-the AI is told to re-run with `output_file` if it wants everything.
+threshold, the response is truncated to the requested head plus a 2 KiB tail.
+Set `output_file` before commands expected to produce large output; only repeat
+a command after confirming that doing so is safe. Per-command previews retain
+up to 1536 head + 512 tail bytes and have their own truncation flag.
+
+The whole batch is validated before execution. Explicit `g`/step commands are
+allowed only as the final standalone statement, never inside a block. `j`
+command-string branches are rejected; use explicit `.if` blocks instead.
+Lifecycle guards inspect statement heads, not quoted words being printed.
+They cannot validate actions hidden in aliases, extension code or script files.
+
+Execution stops after a failed HRESULT or `DEBUG_OUTPUT_ERROR`. The MCP reply
+has `isError=true`, with `ok=false`, `err`, `failed_command_index`, partial
+`output`, and `results` preserved. Later statements are `not_executed`; previous
+effects are not rolled back. Ordinary debugger text such as unreadable-memory
+`??` or warnings may not be errors, so inspect the evidence as well.
+
+The deadline also covers work queued in the extension. Expired commands are
+not started. A single DbgEng call cannot be safely hard-cancelled; when it
+returns late its status is `completed_after_deadline` and the remaining batch
+is skipped. The host allows 5 seconds of transport grace. If it still has no
+reply, it returns `execution_state="unknown"`, `execution_may_continue=true`
+and `safe_to_retry=false`. Wait for the debugger and inspect state instead of
+blindly resubmitting. File errors preserve available output and report
+`output_file_written=false` with `output_file_error`; do not assume a complete
+log exists.
 
 **Examples:**
 
@@ -114,7 +150,8 @@ wm_run_cmd(
 ```
 
 **Escaping reminder.** The `cmd` string is a JSON string — quotes, backslashes,
-and newlines are encoded by the JSON layer. Do not double-escape. To run
+and newlines are encoded by the JSON layer. Literal backslash plus `n` is not
+a newline and is not automatically unescaped. Do not double-escape. To run
 `dt nt!_EPROCESS @$proc`, pass exactly `"dt nt!_EPROCESS @$proc"`.
 
 **Failure modes:** `not_attached`, `target_running` (if the command requires

@@ -47,6 +47,7 @@ set_target_properties(mcpext PROPERTIES
 )
 
 if(MSVC)
+    target_link_options(mcpext PRIVATE $<$<CONFIG:Release>:/PDBALTPATH:mcpext.pdb>)
     target_compile_options(mcpext PRIVATE
         /W4
         /permissive-

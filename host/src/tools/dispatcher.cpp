@@ -28,7 +28,11 @@ Result ErrJson(const std::string& code, const std::string& msg,
     return r;
 }
 Result FromResponse(const transport::Response& resp) {
-    if (resp.ok) return OkJson(resp.data);
+    if (resp.ok) {
+        auto result = OkJson(resp.data);
+        if (resp.data.is_object() && resp.data.value("ok", true) == false) result.is_error = true;
+        return result;
+    }
     return ErrJson(resp.err.code, resp.err.msg, resp.err.tip, resp.err.hr);
 }
 
@@ -50,10 +54,10 @@ json Dispatcher::Descriptors() const {
     json run_cmd_schema = {
         {"type", "object"},
         {"properties", {
-            {"cmd",           {{"type", "string"},  {"description", "WinDbg command(s); use \\n for multiple"}}},
-            {"timeout_ms",    {{"type", "integer"}, {"default", 30000}}},
+            {"cmd",           {{"type", "string"},  {"description", "UTF-8 commands separated by semicolons or top-level newlines. Stops on first error. Run-control must be the final standalone statement."}}},
+            {"timeout_ms",    {{"type", "integer"}, {"minimum", 1}, {"maximum", 120000}, {"default", 30000}}},
             {"output_file",   {{"type", "string"},  {"description", "Absolute path to stream large output"}}},
-            {"preview_bytes", {{"type", "integer"}, {"default", 8192}}},
+            {"preview_bytes", {{"type", "integer"}, {"minimum", 0}, {"maximum", 1048576}, {"default", 8192}}},
         }},
         {"required", json::array({"cmd"})},
         {"additionalProperties", false},
@@ -86,7 +90,7 @@ json Dispatcher::Descriptors() const {
 
     return json::array({
         tool("wm_session",       "Snapshot of debugger state. Cheap; use as a liveness probe.", empty),
-        tool("wm_run_cmd",       "Run any WinDbg command. Multi-line via \\n. output_file streams big output to disk.", run_cmd_schema),
+        tool("wm_run_cmd",       "Run debugger statements sequentially with per-command results and partial output on failure. Use ; or top-level newlines. Timeout is not rollback; never blindly retry an uncertain execution.", run_cmd_schema),
         tool("wm_wait_event",    "Block until a debugger event arrives. Pass since_ms to replay the last 30s of matching events.", wait_event_schema),
         tool("wm_break_in",      "Halt a running target via SetInterrupt; waits on the ext's break event.", break_in_schema),
         tool("wm_analyze_crash", "Structured BSOD report: !analyze -v + kb + lm + !drvobj, parsed.", analyze_schema),

@@ -1,255 +1,188 @@
 # windbg-mcp
 
-[English](./README.md) | **中文**
+[English](README.md)
 
-把 [WinDbg](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/) 接进 [MCP（Model Context Protocol）](https://modelcontextprotocol.io/) 的桥。
-让 AI 编程助手（Claude Code、Cursor、Cline……）像人一样上手内核调试——
-跑命令、下断点、`!analyze -v`、捕获 BSOD，你能干的它都能干。
+连接 AI Agent 与 Windows 调试器的原生 MCP bridge。通过 `windbg-mcp.exe` 和
+`mcpext.dll`，把调试器状态、命令执行、事件等待与崩溃分析开放为结构化工具。
 
-```
-                  ┌──────────────────────────────────────┐
-                  │  WinDbg                              │
-                  │  ┌────────────────────────────────┐  │
-                  │  │ mcpext.dll                     │  │
-                  │  │  - IDebugEventCallbacks 事件回调 │  │
-                  │  │  - length-prefixed JSON 管道    │  │
-                  │  │  - dbgeng 单线程串行请求通道     │  │
-                  │  └──────────────┬─────────────────┘  │
-                  └─────────────────┴────────────────────┘
-                                    │  选定的 \\.\pipe\<name>
-                                    │  - 4B 长度 + JSON 载荷
-                                    │  - hello / req / resp / ack / event / chunk
-                                    │  - 单连接多路复用
-                                    ▼
-              ┌─────────────────────────────────────┐
-              │  windbg-mcp.exe                     │
-              │  - 单异步连接                       │
-              │  - request id → std::promise        │
-              │  - 事件总线（含历史回放）            │
-              │  - 8 个 MCP 工具                    │
-              └─────────────────────────────────────┘
-                                    │
-                                    ▼  stdio MCP (JSON-RPC)
-                              AI 客户端
+它负责**调试器连接和取证**，不负责创建 VM、编译驱动或恢复 VMware 快照。
+需要完整驱动测试流程时，使用上层 [windows-drv-harness](https://github.com/Letenz/windows-drv-harness)。
+
+```text
+AI / 自写 Agent
+  -> stdio MCP -> windbg-mcp.exe
+       -> 指定的本地命名管道
+            -> mcpext.dll -> WinDbg / KD / CDB -> 调试目标
 ```
 
-两个二进制文件，运行时零额外依赖：
+## 核心特性
 
-| 二进制 | 加载方 | 作用 |
-|---|---|---|
-| `mcpext.dll` | WinDbg (`.load mcpext`) | dbgeng 扩展；订阅调试器事件；处理管道请求 |
-| `windbg-mcp.exe` | AI 客户端（作为 stdio MCP server） | 在 stdio 上跑 MCP JSON-RPC，背后通过命名管道与 ext 通信 |
-
-CRT 全部静态链接，拷到任何 Windows 机器就能跑，**不需要装 VC++ 运行库**。
-
-## MCP 工具
-
-8 个工具，每个职责清晰单一。完整签名和示例工作流见 `docs/tools.md`。
-
-| 工具 | 用途 |
+| 特性 | 能力 |
 |---|---|
-| `wm_session` | 调试器状态快照（`target_kind`、`exec_status`、`ip`、`bugcheck`、……） |
-| `wm_run_cmd` | 原样跑任意 WinDbg 命令；可选把大输出流式落盘 |
-| `wm_wait_event` | 阻塞等待调试器事件（bugcheck、break、模块加载……），带 30 秒历史回放 |
-| `wm_break_in` | 发 `SetInterrupt`，再等 ext 自己的 break 事件——**不再轮询** |
-| `wm_analyze_crash` | 结构化 BSOD 报告：`!analyze -v` + `kb` + `lm` + `!drvobj` 解析成 JSON |
-| `wm_detach` | 只 detach target，bridge 和 host 继续运行 |
-| `wm_shutdown` | response 发出后停止 bridge，不 detach target |
-| `wm_exit` | `wm_detach` 的弃用兼容别名 |
+| 原生 C++ bridge | 两个 x64 二进制，静态链接 CRT，不额外要求安装 VC++ Redistributable |
+| 独立调试会话 | 每组调试器和 MCP host 使用独立 endpoint，支持多组会话同时运行 |
+| 多条命令执行 | 分号或顶层换行分隔命令，保留引号、表达式和控制块的语义 |
+| Unicode 输入输出 | 使用 DbgEng 宽字符接口，UTF-8 结果、文件和分块不截断字符 |
+| 逐条结果与失败证据 | 返回每条命令状态、已执行/跳过数量，失败保留此前输出并停止后续顶层命令 |
+| 大输出落盘 | 完整输出保存到指定文件，返回有截断标记的预览，写入失败不会伪报成功 |
+| 结构化崩溃分析 | 组合 `!analyze -v`、栈和模块检查，提取 bugcheck、故障位置、访问类型等可用证据 |
+| 调试事件等待 | 等待 bugcheck、断点和模块事件，支持近期历史回放，减少模型轮询 |
+| 明确的生命周期 | 区分目标 detach、bridge shutdown 和 MCP host 退出，防止重连时串到其他实例 |
 
-## 编译
+## 环境与编译
 
-需要：
-- Visual Studio 2019 或 2022，装好 C++ 桌面工作负载
-- Windows 10/11 SDK（合理近期的版本即可）
-- CMake 3.20+
+运行需要 Windows x64 和已安装的 Debugging Tools for Windows。`mcpext.dll` 加载在
+调试器内，`windbg-mcp.exe` 由 MCP 客户端启动。静态 CRT 不代表无需安装调试器。
+
+内核调试可使用经典 WinDbg 或 KD，用户态调试可使用 CDB。
+VirtualKD/VMware 是内核实验环境的一种选择，不是 bridge 对所有调试目标的硬依赖。
+
+编译需要支持 C++20 的 Visual Studio C++ 工具链、Windows SDK 和 CMake 3.20+。
+下面使用 Visual Studio 2022；首次配置需要获取 CMake 声明的第三方依赖。
 
 ```powershell
-git clone <repo> windbg-mcp
+git clone https://github.com/Letenz/windbg-mcp.git
 cd windbg-mcp
-cmake -B build -S . -G "Visual Studio 17 2022" -A x64
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
 ```
 
 产物：
+
 - `build/ext/Release/mcpext.dll`
 - `build/host/Release/windbg-mcp.exe`
 
-### 编译选项
+`WINDBGMCP_BUILD_TESTS` 默认开启，`WINDBGMCP_ENABLE_LOGGING` 默认关闭。需要诊断
+bridge 本身时再启用内部日志；显式请求的命令输出文件不受这个编译开关影响。
 
-| CMake 选项 | 默认 | 说明 |
-|---|---|---|
-| `WINDBGMCP_BUILD_TESTS` | `ON` | 构建 GoogleTest 单元测试 |
-| `WINDBGMCP_ENABLE_LOGGING` | `OFF` | 把 `OutputDebugString` + 落盘日志（`mcpext.log` / `windbg-mcp.log` 与二进制同目录）编进来。默认关——生产构建不应该每次工具调用都往使用者磁盘写东西。排障/开发时可以打开 |
+## 接入 Agent
 
-开发/排障时打开日志：
-```powershell
-cmake -B build -S . -DWINDBGMCP_ENABLE_LOGGING=ON
-cmake --build build --config Release
-```
+### 1. 在已配置的调试会话中加载扩展
 
-启用日志后，把 `WINDBGMCP_LOG=1` 设进 `windbg-mcp.exe` 的环境变量可以把级别从 `Info` 提到 `Trace`。
-
-## 安装
-
-没有 installer。两个二进制扔到喜欢的目录，原地运行就行。
-
-典型布局：
-```
-C:\tools\windbg-mcp\
-    mcpext.dll
-    windbg-mcp.exe
-```
-
-## 使用
-
-### 1. 在 WinDbg 里加载扩展
-
-内核调试会话中：
-```
-0: kd> .load C:\tools\windbg-mcp\mcpext.dll
-0: kd> !mcpext.start
-windbgmcp: listening on \\.\pipe\windbgmcp
-```
-
-辅助命令：
-
-- `!mcpext.status` 查看管道和连接状态
-- `!mcpext.stop` 停止管道
-- `!mcpext.help` 列出所有命令
-
-状态还会显示当前 connection generation 和 callback owner 线程。
-
-要给当前 WinDbg 实例分配独立 endpoint，可传短管道名或完整本地 endpoint：
+将两个二进制放到固定目录，例如 `C:\tools\windbg-mcp`，在调试器命令窗口执行：
 
 ```text
-0: kd> !mcpext.start windbgmcp-project-a
-windbgmcp: listening on \\.\pipe\windbgmcp-project-a
+.load C:\tools\windbg-mcp\mcpext.dll
+!mcpext.start windbgmcp-lab-a
+!mcpext.status
 ```
 
-名称只允许 ASCII 字母、数字、`.`、`_`、`-`，最长 240 字符。不带参数的
-调用仍兼容旧行为，使用 `\\.\pipe\windbgmcp`。
+`!mcpext.start` 不带参数时使用默认 endpoint `windbgmcp`。自定义名称允许 ASCII
+字母、数字、`.`、`_`、`-`，最长 240 字符；也接受完整的本地 `\\.\pipe\<name>`。
 
-### 2. 在 AI 客户端注册 MCP server
+示例路径不含空格。自动启动调试器时，可把二进制目录作为工作目录，使用
+`.load .\mcpext.dll`，避免嵌套命令行中的路径转义问题。
 
-**Claude Code CLI**（user 作用域）：
-```powershell
-claude mcp add --scope user windbg-mcp C:\tools\windbg-mcp\windbg-mcp.exe
+### 2. 注册 stdio MCP Server
+
+在 MCP 客户端中配置下面的命令和参数；外层配置格式按客户端要求填写：
+
+```json
+{
+  "command": "C:\\tools\\windbg-mcp\\windbg-mcp.exe",
+  "args": ["--pipe", "windbgmcp-lab-a"]
+}
 ```
 
-其他 MCP 客户端，把 `windbg-mcp.exe` 当成 stdio MCP server 配进去即可。
+host 和扩展必须选择同一个 endpoint。选择优先级是 `--pipe`、环境变量
+`WINDBGMCP_PIPE`、默认值。连接后先调用 `wm_session`，确认目标类型、状态和
+`pipe_endpoint`，不要仅凭进程存在判断连接成功。
 
-host 必须选择与扩展相同的 endpoint。选择优先级依次为 `--pipe`、
-`WINDBGMCP_PIPE`、默认值：
+多会话时，每个调试器实例搭配独立的 MCP host 和唯一 endpoint；每个 endpoint
+同时接受一个 host 连接。该 bridge 不替代 WinDbg/KD 本身的目标连接配置。
 
-```powershell
-C:\tools\windbg-mcp\windbg-mcp.exe --pipe windbgmcp-project-a
-$env:WINDBGMCP_PIPE = "windbgmcp-project-a"
-C:\tools\windbg-mcp\windbg-mcp.exe
-```
+## MCP 工具
 
-多个项目并行时，每个项目启动一组 WinDbg + 扩展 + MCP host，并给每组分配
-唯一管道名。每个 endpoint 仍只接收一个 host 连接。
+七个主要工具，加一个弃用兼容别名。完整参数见 [工具文档](docs/tools.md)。
 
-### 安全停止
+| 工具 | 职责 |
+|---|---|
+| `wm_session` | 查看目标类型、执行状态、连接 endpoint，以及可获得的 bugcheck/上下文 |
+| `wm_run_cmd` | 执行命令批次，返回逐条结果、输出和可选完整日志 |
+| `wm_wait_event` | 等待调试事件；默认回看最近 10 秒的可用历史 |
+| `wm_break_in` | 暂停运行中的目标，等待 break；已暂停时直接返回 |
+| `wm_analyze_crash` | 返回结构化崩溃报告及原始诊断文本 |
+| `wm_detach` | 分离调试目标，保留 bridge 和 MCP host |
+| `wm_shutdown` | 响应完成后停止 bridge，不改变目标挂接状态，不退出 MCP host |
+| `wm_exit` | `wm_detach` 的弃用兼容别名，不表示关闭全部进程 |
 
-事件 sink 在专用 owner actor 中通过 `DebugCreate` 创建线程绑定的 dbgeng client。
-初始化必须异步进行：WinDbg 执行扩展命令时已持有内部 engine lock，如果此时等待
-另一个线程进入 dbgeng 会形成死锁。callback 使用非阻塞泵，并与串行 request lane
-共用 engine coordinator。远程只停止 bridge 时使用 `wm_shutdown`；卸载扩展或
-重启 target 前，也可以直接在 WinDbg 中执行 `!mcpext.stop`。
-`wm_run_cmd` 会拒绝 `!mcpext.*`、`.reboot`、`.unload` 和退出
-调试器命令，防止 MCP worker 尚在执行时同步卸载其代码。
-
-真正的安全边界是 `DebugExtensionCanUnload`：只要 lifecycle 尚未进入
-`Stopped`，或仍有 Router worker、callback actor、异步事件 publisher、teardown 活动，它就返回
-`S_FALSE`。`!mcpext.stop` 只在 lifecycle mutex 内转移状态和资源，随后调度
-reaper 并立即返回，避免在扩展命令持有 engine lock 时 join dbgeng 线程。reaper
-负责关闭管道、在 owner 线程卸载 callback、join request worker，最后发布
-`Stopped`。对于 `wm_shutdown`，扩展会在发起请求的 connection generation 上执行
-有界的 terminal response/host ACK 交换，再原子封闭该 generation，最后唤醒启动
-提交前已预建的 teardown executor。stdio MCP host 不会退出，但会固定到原 bridge
-instance；扩展重新启动后即使复用同名 endpoint，也要重启 host 才能显式绑定。
-
-### 3. 让 AI 操作调试器
-
-AI 现在可以调用 8 个工具中的任意一个。典型的内核驱动调试流程大致是：
+与上层 Harness 的 `debug_run` 不同，原生 `wm_run_cmd` 不会自动暂停目标。
+运行中的目标应先调用 `wm_break_in`。以下是工具调用示意，不是 Python SDK：
 
 ```python
-# 大致是 AI 视角下的调用：
-wm_session()                                          # 确认已附加
-wm_run_cmd("bp myDriver!DriverEntry")
-wm_run_cmd("g")
-wm_wait_event(kinds=["breakpoint_hit", "bugcheck"])   # 阻塞到命中
-wm_run_cmd("r; k; dt _DRIVER_OBJECT @rcx")
-# ... 一段时间后跑出 BSOD ...
-report = wm_analyze_crash()                           # 拿到结构化 JSON
+wm_session()
+wm_break_in()
+wm_run_cmd(cmd="vertarget; r\nlm m nt")
 ```
 
-`wm_wait_event` **默认回看最近 10 秒的历史事件**——AI 在某个动作之后才订阅时不会错过刚发生的事件。
+## 批量命令与结果
 
-## 自动重连 / 生命周期
+`cmd` 是一个 UTF-8 字符串，不是数组、shell 脚本或 Markdown 代码块。
 
-`windbg-mcp.exe` 对同一个扩展实例的偶发断线**保持 AI 端 stdio 连接不掉线**：
+- 最多 64 条顶层命令，以分号或实际换行分隔；字面量反斜杠加 `n` 不会自动解转义。
+- 引号、表达式和控制块保持完整；控制块内仍使用 WinDbg 的分号规则。
+- 别名、脚本命令和 `*` 注释等消费整行的语法，仍保留 WinDbg 原生行为。
+- `g`、步进等运行控制只能是最后一条独立命令，不能放在批次中间或控制块里。
+- 不支持 `j` 的命令字符串分支，改用显式 `.if` 控制块。
+- 整批先做结构校验；某条命令返回失败 HRESULT 或错误输出后，后续顶层命令跳过。
 
-- 偶发管道断开 —— 所有等待中的请求立刻以 `disconnected` 失败，下一次请求触发重连
+| 结果字段 | 含义 |
+|---|---|
+| `ok` / MCP `isError` | 执行结果；收到响应不代表命令成功 |
+| `results` | 每条命令的索引、状态及可用的输出预览 |
+| `commands_executed` / `commands_skipped` | 实际执行数量与跳过数量 |
+| `failed_command_index` | 失败命令位置（适用时） |
+| `output` / `bytes_total` / `truncated_in_response` | 合并输出、完整字节数和预览截断标记 |
+| `output_file_written` / `output_file_error` | 指定输出文件的写入结果 |
 
-每次 `!mcpext.start` 都会在首帧 `hello` 中生成新的 `bridge_instance_id`。host 会固定
-首次看到的 ID；扩展重载、WinDbg 重启，或另一 WinDbg 复用同名 endpoint 时都会被
-拒绝。要绑定新实例，需显式重启 `windbg-mcp.exe`。
+失败响应仍保留已有输出。单条状态包括 `succeeded`、`failed`、
+`completed_after_deadline` 和 `not_executed`。缺失扩展不会仅因 API 返回成功就被
+当成执行成功；普通警告或不可读内存的 `??` 仍需结合实际内容判断。
 
-每次连接都会获得单调递增的 generation。断线后，旧 generation 的排队任务会被
-丢弃，其 response/chunk 也不会发送给新 client。扩展在两个 client 之间持续持有
-同一个服务端 pipe handle，因此其他进程无法趁重连窗口抢占 endpoint。
+### 大输出与超时
 
-## 线路协议
+为大输出事先指定 `output_file`，使用父目录已存在的本机绝对路径。扩展在执行后
+写入完整 UTF-8 内容，包含已获得的失败输出；返回值只保留预览。不要为了补日志
+盲目重跑有副作用的命令。
 
-单个全双工命名管道，承载长度前缀的 JSON 帧。
+`timeout_ms` 是执行预算，范围 1 到 120000 ms，不是对 DbgEng 的硬取消承诺。
+过期的排队命令不再启动；单条命令超时返回后，剩余顶层命令跳过。
 
-```
-+------------------+----------------------------+
-|  4 字节          |  N 字节                    |
-|  uint32 LE       |  UTF-8 JSON payload        |
-|  payload 长度    |                            |
-+------------------+----------------------------+
-```
+如果 host 等待预算及 5 秒宽限后仍未收到结果，会返回
+`execution_state="unknown"`、`execution_may_continue=true` 和
+`safe_to_retry=false`。**正在执行的命令可能继续，已发生的修改不会回滚。**
+先等待调试器恢复响应并检查状态，不要直接重发整个批次。
 
-6 种帧：`hello` / `req` / `resp` / `ack` / `event` / `chunk`。请求通过 `id` 多路复用；事件异步推送。
-不同 WinDbg/host 组合使用唯一 endpoint 时可同时运行。完整规范和错误码列表见
-`docs/protocol.md`。
+## 生命周期与隔离
 
-## 仓库结构
+`wm_detach` 只处理目标，`wm_shutdown` 只停止 bridge。要结束 stdio MCP host，
+由客户端关闭或终止对应的 `windbg-mcp.exe`，不要把 shutdown 当作进程退出。
 
-```
-windbg-mcp/
-├── CMakeLists.txt                顶层 CMake
-├── README.md / README_zh.md      项目说明（英/中）
-├── docs/
-│   ├── protocol.md               管道帧规范、错误码、超时
-│   ├── events.md                 事件目录 + 历史回放语义
-│   └── tools.md                  MCP 工具表面、签名、典型工作流
-├── ext/                          C++ WinDbg 扩展 DLL
-│   ├── CMakeLists.txt
-│   └── src/{ipc,events,handlers,util}
-├── host/                         C++ MCP server (stdio + 管道 桥)
-│   ├── CMakeLists.txt
-│   └── src/{transport,mcp,tools,analysis,util}
-└── tests/
-    ├── ext/                      gtest：帧编解码、事件历史
-    └── host/                     gtest：帧编解码、解析器、endpoint/参数
-```
+同一个扩展实例的临时断线可以重连。扩展重新启动后，即使沿用同名 endpoint，也会
+生成新的 `bridge_instance_id`；host 不会自动绑定新实例，需要重启 MCP host。
+旧连接的排队请求和迟到响应不会被转交给替代连接。
 
-## 状态
+`wm_run_cmd` 会拒绝 `!mcpext.*`、`.unload`、`.reboot` 和调试器退出等生命周期
+命令，避免工作线程还在执行时卸载其代码。需要时使用专用工具，或在调试器中执行
+`!mcpext.stop` 后再进行人工操作。
 
-v2.0。管道传输、事件推送、核心调试操作和 `.reboot` 生命周期已在真机内核调试
-会话（VirtualKD + WinDbg Preview）上验证通过。已知限制：
+这些检查不是任意调试脚本的安全沙箱，无法验证藏在别名、脚本文件或扩展中的全部
+动作。只向可信 Agent 开放自己的调试环境。
 
-- 单个 WinDbg 内的请求在一个 dbgeng worker 上 FIFO 串行执行；这是为了遵守
-  `IDebugClient` 线程亲和性而做的取舍。长时间 `wm_wait_event` 会推迟同一
-  endpoint 上的后续请求；并行能力来自不同 endpoint
-- `wm_analyze_crash` 解析器基于 Windows 10/11 的 `!analyze -v` 输出开发；
-  老版本可能需要补充解析规则
+## 示例
+
+[Harness 的 HelloWorld 示例](https://github.com/Letenz/windows-drv-harness/tree/main/example/HelloWorld)
+使用本 bridge 完成驱动调试和取证，已使用 `qwen3.8-flash` 和 `glm-5.3-flash` 跑通。
+
+## 使用限制
+
+- 单个调试器 endpoint 内请求串行执行，长命令或事件等待会延迟后续请求；并行能力来自独立会话。
+- 崩溃解析取决于符号、调试器输出和目标信息，字段可能缺失。原始文本和日志是核对依据。
+- 控制块仍由 DbgEng 执行，逐条停止和超时边界针对顶层命令，不代表能中断控制块内部的每一步。
+
+更多细节见 [工具文档](docs/tools.md)、[事件语义](docs/events.md)和[管道协议](docs/protocol.md)。
 
 ## License
 
-MIT。见 `LICENSE`。
+MIT。第三方依赖保留各自许可证。

@@ -1,18 +1,12 @@
 // SPDX-License-Identifier: MIT
 //
-// wm_run_cmd: passthrough + optional streaming to a local file.
-//
-// When the AI supplies `output_file`, we open the file on the host side
-// and the chunk_sink callback writes UTF-8 bytes as they arrive on the
-// pipe. The final response payload still contains a head+tail preview so
-// the AI can reason about content without re-reading the file.
+// wm_run_cmd: validated batches with a shared deadline and retained evidence.
+// The same-host extension owns output_file and returns a UTF-8 preview.
 
 #include "tools/dispatcher.h"
 #include "util/path.h"
 
-#include <fstream>
-#include <memory>
-#include <mutex>
+#include <Windows.h>
 
 namespace wmh::tools {
 
@@ -24,49 +18,48 @@ Result RunCmd(transport::PipeClient& pipe, const json& args) {
         return ErrJson("invalid_arg", "cmd must be a non-empty string");
     }
     const std::string cmd = args["cmd"].get<std::string>();
-    const std::uint32_t timeout_ms = args.value("timeout_ms", 30000u);
-    if (timeout_ms == 0) {
-        return ErrJson("invalid_arg", "timeout_ms must be > 0");
+    for (const auto& [key, value] : args.items()) {
+        if (key != "cmd" && key != "timeout_ms" && key != "preview_bytes" && key != "output_file")
+            return ErrJson("invalid_arg", "unknown run_cmd argument: " + key);
     }
+    for (auto key : {"timeout_ms", "preview_bytes"}) {
+        if (!args.contains(key)) continue;
+        const auto& value = args[key];
+        const auto minimum = std::string(key) == "timeout_ms" ? 1 : 0;
+        const auto maximum = std::string(key) == "timeout_ms" ? 120000 : 1048576;
+        if (!value.is_number_integer() || value < minimum || value > maximum)
+            return ErrJson("invalid_arg", std::string(key) + " is outside its integer range");
+    }
+    const std::uint32_t timeout_ms = args.value("timeout_ms", 30000u);
     const std::uint32_t preview_bytes = args.value("preview_bytes", 8192u);
 
     json forward = {
         {"cmd",           cmd},
         {"timeout_ms",    timeout_ms},
         {"preview_bytes", preview_bytes},
+        {"deadline_tick_ms", ::GetTickCount64() + timeout_ms},
     };
 
-    std::shared_ptr<std::ofstream> file_out;
-    std::shared_ptr<std::mutex>    file_mu;
-
-    if (args.contains("output_file") && args["output_file"].is_string()) {
+    if (args.contains("output_file")) {
+        if (!args["output_file"].is_string()) return ErrJson("invalid_arg", "output_file must be a string");
         std::string err;
         auto v = path::ValidateOutputFile(args["output_file"].get<std::string>(), err);
         if (!v) return ErrJson("invalid_arg", err);
-        file_out = std::make_shared<std::ofstream>(v->wide,
-                       std::ios::binary | std::ios::trunc);
-        if (!file_out->is_open()) {
-            return ErrJson("invalid_arg",
-                           "cannot open output_file: " + v->utf8,
-                           "check that the parent directory exists");
-        }
-        file_mu = std::make_shared<std::mutex>();
         forward["output_file"] = v->utf8;
     }
-
-    transport::ChunkSink sink;
-    if (file_out) {
-        sink = [file_out, file_mu](std::string_view chunk, bool eof) {
-            std::lock_guard<std::mutex> lk(*file_mu);
-            if (!chunk.empty()) {
-                file_out->write(chunk.data(), static_cast<std::streamsize>(chunk.size()));
-            }
-            if (eof) file_out->close();
-        };
+    // The extension is on the same host and owns the output file. Do not open
+    // a second truncating writer before validation or overwrite error evidence.
+    auto resp = pipe.Request("run_cmd", forward, timeout_ms + 5000);
+    auto result = FromResponse(resp);
+    if (!resp.ok && (resp.err.code == "timeout" || resp.err.code == "disconnected")) {
+        auto payload = json::parse(result.text);
+        payload["execution_may_continue"] = true;
+        payload["safe_to_retry"] = false;
+        payload["execution_state"] = "unknown";
+        payload["err"]["tip"] = "do not resubmit blindly; wait for the debugger to respond and inspect state; a timeout is not cancellation or rollback";
+        result.text = payload.dump();
     }
-
-    auto resp = pipe.Request("run_cmd", forward, timeout_ms + 5000, sink);
-    return FromResponse(resp);
+    return result;
 }
 
 } // namespace wmh::tools

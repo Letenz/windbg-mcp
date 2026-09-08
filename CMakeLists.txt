@@ -36,9 +36,8 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 #   /DEBUG           (linker)    emit a .pdb next to the binary
 #   /OPT:REF         (linker)    strip unreferenced functions/data
 #   /OPT:ICF         (linker)    fold identical COMDATs
-#   /PDBALTPATH:%_PDB% (linker)  embed PDB *basename only* in the binary,
-#                                so the build-machine absolute path does
-#                                not leak into shipped DLL/EXE
+# Shipped targets set literal /PDBALTPATH basenames in their own CMake files.
+# Visual Studio generators escape percent macros, so %_PDB% is not used here.
 #
 # /DEBUG defaults to disabling /OPT:REF and /OPT:ICF; we re-enable them
 # explicitly so the released binary is still as small/optimised as without
@@ -50,7 +49,6 @@ if(MSVC)
         $<$<CONFIG:Release>:/DEBUG>
         $<$<CONFIG:Release>:/OPT:REF>
         $<$<CONFIG:Release>:/OPT:ICF>
-        $<$<CONFIG:Release>:/PDBALTPATH:%_PDB%>
     )
 endif()
 

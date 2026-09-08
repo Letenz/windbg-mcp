@@ -46,6 +46,7 @@ target_link_libraries(windbg-mcp
 )
 
 if(MSVC)
+    target_link_options(windbg-mcp PRIVATE $<$<CONFIG:Release>:/PDBALTPATH:windbg-mcp.pdb>)
     target_compile_options(windbg-mcp PRIVATE
         /W4
         /permissive-

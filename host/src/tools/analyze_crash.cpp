@@ -37,6 +37,8 @@ std::string RunOnce(transport::PipeClient& pipe, const std::string& cmd,
         }
         return {};
     }
+    if (out_err && resp.data.value("ok", true) == false)
+        *out_err = resp.data.value("err", json::object());
     return resp.data.value("output", std::string{});
 }
 
@@ -95,7 +97,8 @@ Result AnalyzeCrash(transport::PipeClient& pipe, const json& args) {
         }
     }
 
-    json stack   = analysis::stack::ParseKb(kb_text);
+    json stack   = analysis::stack::ParseKb(analyze_text);
+    if (stack.empty()) stack = analysis::stack::ParseKb(kb_text);
     json iret    = analysis::bugcheck::ParseIretFrame(analyze_text);
     json context = analysis::bugcheck::ParseContext(analyze_text);
 

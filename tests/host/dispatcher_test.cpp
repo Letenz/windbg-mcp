@@ -38,3 +38,28 @@ TEST(DispatcherTools, LifecycleToolsHaveDistinctAndClosedSchemas) {
                   "Deprecated"),
               std::string::npos);
 }
+
+TEST(DispatcherTools, SemanticCommandErrorsPreserveEvidence) {
+    wmh::transport::Response response;
+    response.ok = true;
+    response.data = {{"ok", false}, {"output", "prefix and failure"}, {"commands_executed", 2},
+                     {"err", {{"code", "engine_error"}}}};
+    const auto result = wmh::tools::FromResponse(response);
+    EXPECT_TRUE(result.is_error);
+    EXPECT_EQ(nlohmann::json::parse(result.text)["output"], "prefix and failure");
+}
+
+TEST(DispatcherTools, RejectsInvalidRunCommandArgumentsWithoutConnecting) {
+    wmh::transport::PipeClient pipe("windbgmcp-no-connection-needed");
+    wmh::tools::Dispatcher dispatcher(pipe);
+    for (const auto& args : std::vector<nlohmann::json>{
+        {{"cmd", "r"}, {"timeout_ms", -1}}, {{"cmd", "r"}, {"timeout_ms", 0}},
+        {{"cmd", "r"}, {"timeout_ms", "100"}}, {{"cmd", "r"}, {"timeout_ms", 120001}},
+        {{"cmd", "r"}, {"preview_bytes", -1}}, {{"cmd", "r"}, {"output_file", 3}},
+        {{"cmd", "r"}, {"unknown", true}}, {{"cmd", nlohmann::json::array({"r", "k"})}},
+    }) {
+        const auto result = dispatcher.Call("wm_run_cmd", args);
+        EXPECT_TRUE(result.is_error);
+        EXPECT_EQ(nlohmann::json::parse(result.text)["err"]["code"], "invalid_arg");
+    }
+}

@@ -26,10 +26,9 @@ std::string LowerHex(std::string s) {
     return t;
 }
 
-// kb frame layout (whitespace-tolerant), one regex applied per line.
-//   <2-hex frame> <child SP> <return addr> [: <0..4 args>] : <callsite>
+// WinDbg may omit Child-SP in kb or the frame index in STACK_TEXT.
 static const std::regex kFrameRe(
-    R"(^\s*([0-9a-fA-F]{2})\s+([0-9a-fA-F`]+)\s+([0-9a-fA-F`]+)\s*(?::(?:\s+[0-9a-fA-F]+){0,4}\s*)?:\s*(.+?)\s*$)");
+    R"(^\s*(?:([0-9a-fA-F]{2})\s+)?([0-9a-fA-F`]{8,17})(?:\s+([0-9a-fA-F`]{8,17}))?\s*(?::(?:\s+[0-9a-fA-F`]+){0,4}\s*)?:\s*(.+?)\s*$)");
 
 // Split text into lines (CR-stripped, empty preserved).
 std::vector<std::string> Split_lines(std::string_view text) {
@@ -57,9 +56,15 @@ json ParseKb(std::string_view text) {
         std::smatch m;
         if (!std::regex_match(line, m, kFrameRe)) continue;
         json frame = json::object();
-        frame["frame"]  = std::stoi(m[1].str(), nullptr, 16);
-        frame["addr"]   = LowerHex(m[3].str());
-        const std::string callsite = m[4].str();
+        frame["frame"]  = m[1].matched ? std::stoi(m[1].str(), nullptr, 16) : static_cast<int>(frames.size());
+        frame["addr"]   = LowerHex(m[3].matched ? m[3].str() : m[2].str());
+        std::string callsite = m[4].str();
+        static const std::regex source_re(R"(\s+\[(.*)\s+@\s+(\d+)\]\s*$)");
+        std::smatch source;
+        if (std::regex_search(callsite, source, source_re)) {
+            frame["source"] = {{"file", source[1].str()}, {"line", std::stoi(source[2].str())}};
+            callsite.erase(static_cast<std::size_t>(source.position()));
+        }
 
         std::string module, func, offset;
         auto bang = callsite.find('!');

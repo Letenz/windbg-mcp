@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //
-// run_cmd: pipe a string to IDebugControl::Execute, capture all output via
-// a temporary IDebugOutputCallbacks, return ANSI->UTF8 text.
+// run_cmd: execute validated top-level statements with Unicode I/O and retain
+// per-command evidence, including errors and deadlines.
 //
 // Truncation: caller can request output_file streaming via the chunk
 // channel; if not, we return the full output up to kInlineOutputSoftLimit
@@ -26,11 +26,13 @@
 
 #include <DbgEng.h>
 #include <atlbase.h>
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <utility>
 
 namespace windbgmcp::handlers {
 
@@ -39,12 +41,12 @@ using ipc::HandlerError;
 
 namespace {
 
-class CaptureSink : public IDebugOutputCallbacks {
+class CaptureSink : public IDebugOutputCallbacksWide {
 public:
     STDMETHOD(QueryInterface)(REFIID iid, PVOID* iface) override {
         if (!iface) return E_POINTER;
-        if (iid == __uuidof(IUnknown) || iid == __uuidof(IDebugOutputCallbacks)) {
-            *iface = static_cast<IDebugOutputCallbacks*>(this);
+        if (iid == __uuidof(IUnknown) || iid == __uuidof(IDebugOutputCallbacksWide)) {
+            *iface = static_cast<IDebugOutputCallbacksWide*>(this);
             return S_OK;
         }
         *iface = nullptr;
@@ -53,7 +55,7 @@ public:
     STDMETHOD_(ULONG, AddRef)()  override { return 1; } // stack-allocated, no refcount
     STDMETHOD_(ULONG, Release)() override { return 1; }
 
-    STDMETHOD(Output)(ULONG mask, PCSTR text) override {
+    STDMETHOD(Output)(ULONG mask, PCWSTR text) override {
         if (!text) return S_OK;
         // Filter to "interesting" output. NORMAL/ERROR/WARNING/SYMBOL covers
         // virtually everything an interactive user would see.
@@ -63,19 +65,28 @@ public:
         if ((mask & kept) == 0) return S_OK;
         std::lock_guard<std::mutex> lk(m_mu);
         m_buf.append(text);
+        if (mask & DEBUG_OUTPUT_ERROR) m_error = true;
         return S_OK;
     }
 
-    std::string Take() {
+    std::pair<std::string, bool> Take() {
         std::lock_guard<std::mutex> lk(m_mu);
-        std::string out;
+        std::wstring out;
         out.swap(m_buf);
-        return out;
+        const bool error = m_error;
+        m_error = false;
+        return {encoding::WideToUtf8(out), error};
     }
 
 private:
     std::mutex  m_mu;
-    std::string m_buf;
+    std::wstring m_buf;
+    bool m_error = false;
+};
+
+struct CaptureBinding {
+    IDebugClient5* client;
+    ~CaptureBinding() { client->SetOutputCallbacksWide(nullptr); }
 };
 
 // Compose head + tail with truncation marker.
@@ -83,15 +94,20 @@ std::string HeadTailTruncate(const std::string& s,
                              std::size_t head_bytes,
                              std::size_t tail_bytes) {
     if (s.size() <= head_bytes + tail_bytes) return s;
-    const std::size_t hidden = s.size() - head_bytes - tail_bytes;
+    std::size_t head_end = head_bytes;
+    std::size_t tail_begin = s.size() - tail_bytes;
+    auto continuation = [&](std::size_t i) { return (static_cast<unsigned char>(s[i]) & 0xc0) == 0x80; };
+    while (head_end > 0 && continuation(head_end)) --head_end;
+    while (tail_begin < s.size() && continuation(tail_begin)) ++tail_begin;
+    const std::size_t hidden = tail_begin - head_end;
     char marker[96];
     std::snprintf(marker, sizeof(marker),
                   "\n[...truncated %zu bytes...]\n", hidden);
     std::string out;
     out.reserve(head_bytes + tail_bytes + 64);
-    out.append(s, 0, head_bytes);
+    out.append(s, 0, head_end);
     out.append(marker);
-    out.append(s, s.size() - tail_bytes, tail_bytes);
+    out.append(s, tail_begin, s.size() - tail_begin);
     return out;
 }
 
@@ -112,9 +128,8 @@ void SendChunk(ipc::PipeServer& pipe, std::int64_t req_id, std::uint32_t seq,
 void StreamToFile(ipc::PipeServer& pipe, std::int64_t req_id,
                   const std::string& body, const std::string& path,
                   ipc::ConnectionGeneration generation) {
-    // Write to disk, then chunk to the wire. The protocol guarantees the
-    // server applies file writes in chunk-arrival order; since we send
-    // everything before returning, ordering is trivially correct.
+    // The extension owns the same-host file; chunks remain available to
+    // protocol clients but must not trigger a second truncating file writer.
     {
         std::ofstream f(encoding::Utf8ToWide(path), std::ios::binary | std::ios::trunc);
         if (!f) {
@@ -122,16 +137,21 @@ void StreamToFile(ipc::PipeServer& pipe, std::int64_t req_id,
                                "check path is absolute and parent exists");
         }
         f.write(body.data(), static_cast<std::streamsize>(body.size()));
+        f.close();
+        if (!f) throw HandlerError(err::kEngineError, "cannot write complete output_file: " + path,
+                                   "inspect retained output and available disk space; do not blindly repeat commands");
     }
 
     // Chunk the body. Roughly 64 KiB per chunk.
     constexpr std::size_t kChunkBytes = 64 * 1024;
     std::uint32_t seq = 0;
-    for (std::size_t off = 0; off < body.size(); off += kChunkBytes) {
-        const std::size_t take = std::min(kChunkBytes, body.size() - off);
-        const bool eof = (off + take) == body.size();
+    for (std::size_t off = 0; off < body.size();) {
+        std::size_t end = std::min(off + kChunkBytes, body.size());
+        while (end < body.size() && (static_cast<unsigned char>(body[end]) & 0xc0) == 0x80) --end;
+        const bool eof = end == body.size();
         SendChunk(pipe, req_id, seq++, eof,
-                  std::string_view(body.data() + off, take), generation);
+                  std::string_view(body.data() + off, end - off), generation);
+        off = end;
     }
     if (body.empty()) {
         SendChunk(pipe, req_id, 0, true, "", generation);
@@ -146,11 +166,16 @@ json RunCmd(std::int64_t req_id, const json& args, ipc::PipeServer& pipe,
         throw HandlerError(err::kInvalidArg, "cmd is required and must be a string", "");
     }
     const std::string cmd = args["cmd"].get<std::string>();
+    const auto batch = ParseCommandBatch(cmd);
+    if (!batch.error.empty()) throw HandlerError(err::kInvalidArg, batch.error, "fix the command delimiters");
+    if (const auto unsafe = UnsafeRunControl(batch)) {
+        throw HandlerError(err::kInvalidArg, *unsafe, "put g/step in a separate call or as the final statement");
+    }
     if (const auto unsafe = UnsafeLifecycleCommand(cmd)) {
         throw HandlerError(
             err::kInvalidArg,
             "lifecycle-changing command refused on the MCP worker: " + *unsafe,
-            "run !mcpext.stop in WinDbg, then issue the command directly there");
+            "use wm_shutdown/wm_detach or the debugger's own command window for lifecycle changes");
     }
     const std::uint32_t timeout_ms =
         args.value("timeout_ms", static_cast<std::uint32_t>(kTimeoutStandardMs));
@@ -162,6 +187,9 @@ json RunCmd(std::int64_t req_id, const json& args, ipc::PipeServer& pipe,
     if (timeout_ms == 0) {
         throw HandlerError(err::kInvalidArg, "timeout_ms must be > 0", "");
     }
+    const auto deadline = (std::min)(
+        args.value("deadline_tick_ms", ::GetTickCount64() + timeout_ms),
+        ::GetTickCount64() + timeout_ms);
     // Validate output_file path if given.
     if (!output_file.empty()) {
         if (output_file.find("..") != std::string::npos) {
@@ -207,14 +235,16 @@ json RunCmd(std::int64_t req_id, const json& args, ipc::PipeServer& pipe,
                            "call wm_break_in first");
     }
 
-    // Install our output capture, swapping out (and restoring) any existing one.
-    CComPtr<IDebugClient> cap_client;
-    HRESULT hr = ::DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(&cap_client));
+    // Capture through a separate client without replacing the UI callbacks.
+    CaptureSink sink;
+    CComPtr<IDebugClient5> cap_client;
+    HRESULT hr = ::DebugCreate(__uuidof(IDebugClient5), reinterpret_cast<void**>(&cap_client));
     if (FAILED(hr)) {
         throw HandlerError(err::kEngineError, "DebugCreate (capture) failed", "", hr);
     }
-    CaptureSink sink;
-    cap_client->SetOutputCallbacks(&sink);
+    hr = cap_client->SetOutputCallbacksWide(&sink);
+    if (FAILED(hr)) throw HandlerError(err::kEngineError, "SetOutputCallbacksWide failed", "", hr);
+    CaptureBinding binding{cap_client};
 
     // Use the capture client's IDebugControl so the output goes to OUR sink
     // and not WinDbg's UI. dbgeng will fan out to all clients' callbacks
@@ -224,33 +254,54 @@ json RunCmd(std::int64_t req_id, const json& args, ipc::PipeServer& pipe,
         throw HandlerError(err::kEngineError, "QI IDebugControl4 (capture) failed", "");
     }
 
-    WMCP_LOG(Info, std::string("run_cmd[") + std::to_string(req_id) +
-                   "] cmd=" + cmd);
-    const auto t_exec_start = std::chrono::steady_clock::now();
-    hr = cap_ctl->Execute(DEBUG_OUTCTL_THIS_CLIENT |
-                          DEBUG_OUTCTL_OVERRIDE_MASK |
-                          DEBUG_OUTCTL_NOT_LOGGED,
-                          cmd.c_str(),
-                          DEBUG_EXECUTE_NO_REPEAT | DEBUG_EXECUTE_NOT_LOGGED);
-    const auto t_exec_end = std::chrono::steady_clock::now();
-    const auto exec_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            t_exec_end - t_exec_start).count();
-    cap_client->SetOutputCallbacks(nullptr);
-    WMCP_LOG(Info, std::string("run_cmd[") + std::to_string(req_id) +
-                   "] Execute returned hr=0x" +
-                   [hr]{ char b[16]; std::snprintf(b, sizeof(b), "%08x",
-                                          static_cast<unsigned>(hr)); return std::string(b); }() +
-                   " elapsed_ms=" + std::to_string(exec_ms));
-
-    if (FAILED(hr)) {
-        throw HandlerError(err::kEngineError,
-                           "IDebugControl::Execute failed",
-                           "check command syntax", hr);
+    json response = {{"ok", true}, {"results", json::array()},
+                     {"commands_total", batch.commands.size()}, {"commands_executed", 0},
+                     {"execution_may_continue", false}, {"safe_to_retry", false}};
+    std::string utf8;
+    std::size_t executed = 0;
+    bool stopped = false;
+    for (std::size_t i = 0; i < batch.commands.size(); ++i) {
+        const auto& command = batch.commands[i];
+        if (stopped || ::GetTickCount64() >= deadline) {
+            response["results"].push_back({{"index", i}, {"command", command}, {"status", "not_executed"}});
+            if (!stopped) {
+                response["ok"] = false;
+                response["err"] = {{"code", "timeout"}, {"msg", "command budget expired before execution"},
+                                   {"tip", "inspect results; do not repeat already executed commands"}};
+                stopped = true;
+            }
+            continue;
+        }
+        const auto started = std::chrono::steady_clock::now();
+        const auto wide_command = encoding::Utf8ToWide(command);
+        hr = cap_ctl->ExecuteWide(DEBUG_OUTCTL_THIS_CLIENT | DEBUG_OUTCTL_OVERRIDE_MASK | DEBUG_OUTCTL_NOT_LOGGED,
+                                 wide_command.c_str(), DEBUG_EXECUTE_NO_REPEAT | DEBUG_EXECUTE_NOT_LOGGED);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        auto [output, error_output] = sink.Take();
+        utf8 += output;
+        ++executed;
+        const bool expired = ::GetTickCount64() >= deadline;
+        const bool failed = FAILED(hr) || error_output;
+        response["results"].push_back({
+            {"index", i}, {"command", command},
+            {"status", failed ? "failed" : expired ? "completed_after_deadline" : "succeeded"},
+            {"hresult", static_cast<long>(hr)}, {"error_output", error_output}, {"elapsed_ms", elapsed},
+            {"output", HeadTailTruncate(output, 1536, 512)},
+            {"truncated_in_response", output.size() > 2048},
+        });
+        if (failed || expired) {
+            stopped = true;
+            response["ok"] = false;
+            response["failed_command_index"] = i;
+            response["err"] = {{"code", failed ? "engine_error" : "timeout"},
+                               {"msg", failed ? "debugger command failed; partial output retained" : "command exceeded its budget; remaining commands skipped"},
+                               {"tip", "inspect results/output before deciding what to run next; prior effects are not rolled back"},
+                               {"hr", static_cast<long>(hr)}};
+        }
     }
-
-    // Convert ANSI output to UTF-8 once.
-    std::string captured = sink.Take();
-    std::string utf8 = encoding::AcpToUtf8(captured);
+    response["commands_executed"] = executed;
+    response["commands_skipped"] = batch.commands.size() - executed;
     const std::size_t total = utf8.size();
 
     ULONG exec_after = 0;
@@ -258,35 +309,34 @@ json RunCmd(std::int64_t req_id, const json& args, ipc::PipeServer& pipe,
 
     // Streaming branch.
     if (!output_file.empty()) {
-        StreamToFile(pipe, req_id, utf8, output_file, generation);
+        response["output_file_written"] = false;
+        try {
+            StreamToFile(pipe, req_id, utf8, output_file, generation);
+            response["output_file_written"] = true;
+        } catch (const HandlerError& error) {
+            response["ok"] = false;
+            response["output_file_error"] = {{"code", error.code()}, {"msg", error.msg()}, {"tip", error.tip()}};
+            if (!response.contains("err")) response["err"] = response["output_file_error"];
+        }
         std::string preview = HeadTailTruncate(utf8, preview_head, kPreviewTail);
-        return json{
-            {"output",                preview},
-            {"output_file",           output_file},
-            {"bytes_total",           total},
-            {"truncated_in_response", utf8.size() > preview.size()},
-            {"exec_status_after",     status::ToString(exec_after)},
-        };
+        response.update({{"output", preview}, {"output_file", output_file}, {"bytes_total", total},
+                         {"truncated_in_response", total > preview_head + kPreviewTail},
+                         {"exec_status_after", status::ToString(exec_after)}});
+        return response;
     }
 
     // Non-streaming branch.
     if (utf8.size() > kInlineOutputSoftLimit) {
         std::string preview = HeadTailTruncate(utf8, preview_head, kPreviewTail);
-        return json{
-            {"output",                preview},
-            {"bytes_total",           total},
-            {"truncated_in_response", true},
-            {"exec_status_after",     status::ToString(exec_after)},
-            {"hint",                  "specify output_file to capture full output"},
-        };
+        response.update({{"output", preview}, {"bytes_total", total}, {"truncated_in_response", true},
+                         {"exec_status_after", status::ToString(exec_after)},
+                         {"hint", "specify output_file to capture full output"}});
+        return response;
     }
 
-    return json{
-        {"output",                utf8},
-        {"bytes_total",           total},
-        {"truncated_in_response", false},
-        {"exec_status_after",     status::ToString(exec_after)},
-    };
+    response.update({{"output", utf8}, {"bytes_total", total}, {"truncated_in_response", false},
+                     {"exec_status_after", status::ToString(exec_after)}});
+    return response;
 }
 
 } // namespace windbgmcp::handlers

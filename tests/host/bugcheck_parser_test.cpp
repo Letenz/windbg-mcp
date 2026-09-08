@@ -90,3 +90,32 @@ TEST(BugcheckParser, ReturnsNullOnEmpty) {
     EXPECT_TRUE(ParseBugcheck("").is_null());
     EXPECT_TRUE(ParseFaulting("nothing here").is_null());
 }
+
+TEST(BugcheckParser, ExceptionAddressSourceAndWriteEvidence) {
+    const auto f = ParseFaulting(R"(
+EXCEPTION_RECORD: ffffb182751416a8
+ExceptionAddress: fffff8027960102c (HelloWorld!DriverEntry+0x000000000000002c)
+Attempt to write to address 0000000000000000
+HelloWorld!DriverEntry+0x2c:
+fffff802`7960102c c60077          mov     byte ptr [rax],77h ds:002b:00000000`00000000=??
+FAULTING_SOURCE_FILE: C:\lab\HelloWorld.c
+FAULTING_SOURCE_LINE_NUMBER: 26
+SYMBOL_NAME: HelloWorld!DriverEntry+2c
+)");
+    ASSERT_TRUE(f.is_object());
+    EXPECT_EQ(f["ip"], "0xfffff8027960102c");
+    EXPECT_EQ(f["module"], "HelloWorld");
+    EXPECT_EQ(f["function"], "DriverEntry");
+    EXPECT_EQ(f["source"]["file"], "C:\\lab\\HelloWorld.c");
+    EXPECT_EQ(f["source"]["line"], 26);
+    EXPECT_EQ(f["access"]["operation"], "write");
+    EXPECT_EQ(f["access"]["address"], "0x0000000000000000");
+    EXPECT_NE(f["instruction"].get<std::string>().find("[rax]"), std::string::npos);
+}
+
+TEST(BugcheckParser, SymbolNameWithoutAddressIsPartialEvidence) {
+    const auto f = ParseFaulting("SYMBOL_NAME: Driver!Callback+10\n");
+    EXPECT_EQ(f["function"], "Callback");
+    EXPECT_TRUE(f["ip"].is_null());
+    EXPECT_TRUE(f["source"].is_null());
+}

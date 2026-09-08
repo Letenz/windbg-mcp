@@ -1,278 +1,212 @@
 # windbg-mcp
 
-**English** | [中文](./README_zh.md)
+[中文说明](README_zh.md)
 
-A Model Context Protocol (MCP) bridge for [WinDbg](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/).
-Plug an AI coding assistant (Claude Code, Cursor, Cline, …) into a live
-kernel-debug session and let it drive WinDbg the same way you would —
-inspect threads, set breakpoints, run `!analyze -v`, react to BSODs, etc.
+A native MCP bridge between AI agents and Windows debuggers. `windbg-mcp.exe`
+and `mcpext.dll` expose debugger state, command execution, event waits and
+crash analysis as structured tools.
 
-```
-                  ┌──────────────────────────────────────┐
-                  │  WinDbg                              │
-                  │  ┌────────────────────────────────┐  │
-                  │  │ mcpext.dll                     │  │
-                  │  │  - IDebugEventCallbacks sink   │  │
-                  │  │  - length-prefixed JSON pipe   │  │
-                  │  │  - serial dbgeng request lane  │  │
-                  │  └──────────────┬─────────────────┘  │
-                  └─────────────────┴────────────────────┘
-                                    │  selected \\.\pipe\<name>
-                                    │  - 4B length + JSON payload
-                                    │  - hello / req / resp / ack / event / chunk
-                                    │  - single connection, multiplexed
-                                    ▼
-              ┌─────────────────────────────────────┐
-              │  windbg-mcp.exe                     │
-              │  - single async connection          │
-              │  - request id → std::promise        │
-              │  - event bus (with history replay)  │
-              │  - 8 MCP tools                      │
-              └─────────────────────────────────────┘
-                                    │
-                                    ▼  stdio MCP (JSON-RPC)
-                              AI client
+This project handles **debugger access and evidence**, not VM creation,
+driver builds or VMware snapshot recovery. For a complete driver-test workflow,
+use [windows-drv-harness](https://github.com/Letenz/windows-drv-harness).
+
+```text
+AI / custom agent
+  -> stdio MCP -> windbg-mcp.exe
+       -> selected local named pipe
+            -> mcpext.dll -> WinDbg / KD / CDB -> debug target
 ```
 
-Two binaries, zero runtime dependencies beyond the OS:
+## Features
 
-| Binary | Loaded by | Role |
-|---|---|---|
-| `mcpext.dll` | WinDbg (`.load mcpext`) | dbgeng extension; subscribes to debugger events; serves pipe requests |
-| `windbg-mcp.exe` | AI client (stdio MCP server) | speaks MCP JSON-RPC on stdio, talks to the ext over the named pipe |
-
-Both are statically linked against the CRT, so you can copy them to any
-Windows host without installing the VC++ Redistributable.
-
-## MCP tools
-
-Eight tools, each with a single clear purpose. See `docs/tools.md` for full
-signatures and example flows.
-
-| Tool | Purpose |
+| Feature | What It Provides |
 |---|---|
-| `wm_session` | snapshot of debugger state (`target_kind`, `exec_status`, `ip`, `bugcheck`, …) |
-| `wm_run_cmd` | run any WinDbg command verbatim; optionally stream large output to disk |
-| `wm_wait_event` | block until a debugger event arrives (bugcheck, break, module load, …) with 30 s history replay |
-| `wm_break_in` | issue `SetInterrupt` and wait on the ext's own break event — no polling |
-| `wm_analyze_crash` | structured BSOD report: `!analyze -v` + `kb` + `lm` + `!drvobj`, parsed into JSON |
-| `wm_detach` | detach the target only; keep the bridge and host running |
-| `wm_shutdown` | stop the bridge after its response is delivered; leave the target attached |
-| `wm_exit` | deprecated compatibility alias for `wm_detach` |
+| Native C++ bridge | Two x64 binaries with a statically linked CRT; no additional VC++ Redistributable installation |
+| Independent sessions | A unique endpoint per debugger/host pair, with multiple pairs operating together |
+| Command batches | Semicolon or top-level newline separators while preserving quotes, expressions and control blocks |
+| Unicode I/O | Wide-character DbgEng APIs and UTF-8 results/files with character-safe chunk boundaries |
+| Per-command evidence | Execution status, executed/skipped counts and retained output; errors stop later top-level commands |
+| Large output files | Full output written to a requested file, explicit preview truncation and file-write failures |
+| Structured crash analysis | Compose `!analyze -v`, stack and module checks into available bugcheck, fault-location and access evidence |
+| Debugger event waits | Wait for bugchecks, breakpoints and module events with recent-history replay |
+| Explicit lifecycle | Separate target detach, bridge shutdown and MCP host exit; pin connections to the selected bridge instance |
 
-## Build
+## Requirements and Build
 
-Requires:
-- Visual Studio 2019 or 2022 with the C++ desktop workload
-- Windows 10/11 SDK (any reasonably recent version)
-- CMake 3.20+
+Runtime requires Windows x64 and installed Debugging Tools for Windows.
+`mcpext.dll` runs inside the debugger; the MCP client launches `windbg-mcp.exe`.
+A static CRT does not remove the debugger requirement.
+
+Use classic WinDbg or KD for kernel debugging and CDB for user-mode debugging.
+VirtualKD/VMware is one kernel-lab configuration, not a bridge requirement
+for every kind of target.
+
+Build with a C++20-capable Visual Studio C++ toolchain, Windows SDK and CMake
+3.20+. The example uses Visual Studio 2022. Initial CMake configuration fetches
+the declared third-party dependencies.
 
 ```powershell
-git clone <repo> windbg-mcp
+git clone https://github.com/Letenz/windbg-mcp.git
 cd windbg-mcp
-cmake -B build -S . -G "Visual Studio 17 2022" -A x64
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
 ```
 
 Outputs:
+
 - `build/ext/Release/mcpext.dll`
 - `build/host/Release/windbg-mcp.exe`
 
-### Build options
+`WINDBGMCP_BUILD_TESTS` defaults to `ON`; `WINDBGMCP_ENABLE_LOGGING` defaults
+to `OFF`. Enable internal logging to diagnose the bridge itself. Explicitly
+requested command-output files work independently of that build option.
 
-| CMake option | Default | What it does |
-|---|---|---|
-| `WINDBGMCP_BUILD_TESTS` | `ON` | build GoogleTest-based unit tests |
-| `WINDBGMCP_ENABLE_LOGGING` | `OFF` | compile in `OutputDebugString` + on-disk logs (`mcpext.log` / `windbg-mcp.log` next to each binary). Off by default — production builds should not write to the operator's disk on every tool call |
+## Connect an Agent
 
-Enable logging for development / triage:
-```powershell
-cmake -B build -S . -DWINDBGMCP_ENABLE_LOGGING=ON
-cmake --build build --config Release
-```
+### 1. Load the Extension in a Configured Debugger Session
 
-With logging enabled, set `WINDBGMCP_LOG=1` in `windbg-mcp.exe`'s environment
-to bump the level from `Info` to `Trace`.
-
-## Install
-
-There's no installer. Drop the two binaries wherever you like; they run
-in place.
-
-A typical layout:
-```
-C:\tools\windbg-mcp\
-    mcpext.dll
-    windbg-mcp.exe
-```
-
-## Use
-
-### 1. Load the WinDbg extension
-
-In a kernel-debug session:
-```
-0: kd> .load C:\tools\windbg-mcp\mcpext.dll
-0: kd> !mcpext.start
-windbgmcp: listening on \\.\pipe\windbgmcp
-```
-
-`!mcpext.status` shows pipe + connection state. `!mcpext.stop` shuts the
-pipe down. Status also reports the active connection generation and callback
-owner thread. `!mcpext.help` lists the commands.
-
-To give this WinDbg instance its own endpoint, pass either a short pipe name
-or a full local endpoint:
+Put both binaries in a stable directory, such as `C:\tools\windbg-mcp`, then
+run these commands in the debugger:
 
 ```text
-0: kd> !mcpext.start windbgmcp-project-a
-windbgmcp: listening on \\.\pipe\windbgmcp-project-a
+.load C:\tools\windbg-mcp\mcpext.dll
+!mcpext.start windbgmcp-lab-a
+!mcpext.status
 ```
 
-Names may contain ASCII letters, digits, `.`, `_`, and `-` (maximum 240
-characters). The no-argument form remains backward compatible and selects
-`\\.\pipe\windbgmcp`.
+With no argument, `!mcpext.start` selects the default endpoint `windbgmcp`.
+Custom names permit ASCII letters, digits, `.`, `_` and `-`, up to 240
+characters. A full local `\\.\pipe\<name>` endpoint is also accepted.
 
-### 2. Register the MCP server with your AI client
+The example path contains no spaces. For automated debugger startup, using
+the binary directory as the working directory and `.load .\mcpext.dll`
+avoids nested command-line path escaping.
 
-For **Claude Code CLI** at user scope:
-```powershell
-claude mcp add --scope user windbg-mcp C:\tools\windbg-mcp\windbg-mcp.exe
+### 2. Register the Stdio MCP Server
+
+Configure this command and argument list in the MCP client, using its
+required outer configuration format:
+
+```json
+{
+  "command": "C:\\tools\\windbg-mcp\\windbg-mcp.exe",
+  "args": ["--pipe", "windbgmcp-lab-a"]
+}
 ```
 
-For other MCP clients, point them at `windbg-mcp.exe` over stdio.
+The host and extension must select the same endpoint. Selection precedence
+is `--pipe`, then `WINDBGMCP_PIPE`, then the default. Call `wm_session` after
+connecting to verify the target type, execution state and `pipe_endpoint`;
+a running process alone does not establish a working debug connection.
 
-The host must select the same endpoint as the extension. Selection precedence
-is `--pipe`, then `WINDBGMCP_PIPE`, then the default:
+For multiple sessions, use a separate host and unique endpoint for each
+debugger instance. Each endpoint accepts one host connection at a time.
+The bridge does not replace the debugger's own target-connection setup.
 
-```powershell
-C:\tools\windbg-mcp\windbg-mcp.exe --pipe windbgmcp-project-a
-$env:WINDBGMCP_PIPE = "windbgmcp-project-a"
-C:\tools\windbg-mcp\windbg-mcp.exe
-```
+## MCP Tools
 
-For parallel projects, start one WinDbg + extension and one MCP host per
-project, with a unique pipe name for each pair. Each endpoint still accepts
-one host connection.
+Seven primary tools plus one deprecated compatibility alias. Full parameters
+are in the [tool reference](docs/tools.md).
 
-### Safe teardown
+| Tool | Purpose |
+|---|---|
+| `wm_session` | Target type, execution state, endpoint and available bugcheck/context details |
+| `wm_run_cmd` | Command batches, per-command results, output and optional full logs |
+| `wm_wait_event` | Wait for debugger events; by default, look back over the last 10 seconds of available history |
+| `wm_break_in` | Break into a running target and wait for the break; return immediately if already paused |
+| `wm_analyze_crash` | Structured crash report with raw diagnostic text |
+| `wm_detach` | Detach the target while keeping the bridge and MCP host alive |
+| `wm_shutdown` | Stop the bridge after response delivery; keep target attachment and the MCP host |
+| `wm_exit` | Deprecated alias for `wm_detach`, not a command to close all processes |
 
-The event sink owns a dedicated dbgeng client created with `DebugCreate` on
-its owner actor. Startup is asynchronous because a WinDbg extension command
-already holds an internal engine lock; waiting there for another thread to
-enter dbgeng would deadlock. Callback pumping is non-blocking and shares the
-same engine coordinator as the serial request lane. Use `wm_shutdown` for a
-remote bridge-only stop, or run `!mcpext.stop` directly in WinDbg before
-unloading the extension or rebooting the target.
-`wm_run_cmd` deliberately rejects
-`!mcpext.*`, `.reboot`,
-`.unload`, and debugger quit commands because executing them on the MCP worker
-could unload code that is still on that worker's stack.
-
-`DebugExtensionCanUnload` is the hard safety barrier behind that usability
-guard. It returns `S_FALSE` while lifecycle state is not `Stopped`, or while a
-Router worker, callback actor, async event publisher, or teardown is
-outstanding. `!mcpext.stop`
-moves the session resources under the lifecycle mutex, schedules a reaper,
-and returns without joining dbgeng threads from inside the extension command.
-The reaper closes the pipe, removes callbacks on their owner thread, joins the
-request worker, and finally publishes `Stopped`. For `wm_shutdown`, the
-extension performs a bounded terminal response/host-ACK exchange on the
-requesting connection generation, atomically fences that generation, and only
-then arms a teardown executor prepared before startup committed. The stdio MCP
-host stays alive but remains pinned to that bridge instance; restart the host
-to bind a deliberately restarted extension, even with the same endpoint name.
-
-### 3. Drive the debugger from the AI
-
-The AI can now call any of the eight tools. A typical kernel-driver
-debugging session might look like:
+Unlike the Harness's high-level `debug_run`, native `wm_run_cmd` does not
+automatically pause the target. Call `wm_break_in` first if it is running.
+These are conceptual tool calls, not a Python SDK:
 
 ```python
-# AI's view, conceptually:
-wm_session()                                          # confirm attached
-wm_run_cmd("bp myDriver!DriverEntry")
-wm_run_cmd("g")
-wm_wait_event(kinds=["breakpoint_hit", "bugcheck"])   # blocks until hit
-wm_run_cmd("r; k; dt _DRIVER_OBJECT @rcx")
-# ... eventually a BSOD fires ...
-report = wm_analyze_crash()                           # structured JSON
+wm_session()
+wm_break_in()
+wm_run_cmd(cmd="vertarget; r\nlm m nt")
 ```
 
-`wm_wait_event` defaults to a 10-second history replay so the AI doesn't
-miss an event that fired while it was mid-call.
+## Batches and Results
 
-## Reconnect / lifecycle
+`cmd` is one UTF-8 string, not an array, shell script or Markdown code fence.
 
-`windbg-mcp.exe` keeps the AI-side stdio connection alive across transient
-disconnects of the same extension instance:
+- Up to 64 top-level commands use semicolons or actual newlines. Literal backslash plus `n` is not automatically unescaped.
+- Quoted strings, expressions and control blocks stay intact. Blocks still use WinDbg's semicolon rules.
+- Line-owning aliases, script commands and `*` comments retain their native consume-the-rest-of-line behavior.
+- Run-control commands such as `g` and stepping must be the final standalone statement, never in the middle or inside a block.
+- `j` command-string branches are unsupported here; use explicit `.if` blocks.
+- Structural validation precedes execution. A failed HRESULT or debugger error output stops subsequent top-level commands.
 
-- Spurious pipe disconnects — all pending requests are failed with
-  `disconnected` and the next request triggers a reconnect
+| Field | Meaning |
+|---|---|
+| `ok` / MCP `isError` | Execution result; receiving a response is not proof of success |
+| `results` | Each command's index, status and available output preview |
+| `commands_executed` / `commands_skipped` | Actual execution and skip counts |
+| `failed_command_index` | Failure position when applicable |
+| `output` / `bytes_total` / `truncated_in_response` | Combined output, full byte count and preview-truncation flag |
+| `output_file_written` / `output_file_error` | Requested output-file write outcome |
 
-Every `!mcpext.start` sends a server-first `hello` with a fresh
-`bridge_instance_id`. The host pins the first value, so an extension reload,
-WinDbg restart, or another WinDbg reusing the same endpoint is rejected.
-Restart `windbg-mcp.exe` to explicitly bind the new instance.
+Errors retain earlier output. Per-command states include `succeeded`,
+`failed`, `completed_after_deadline` and `not_executed`. A missing extension
+is not treated as success just because the API returned successfully.
+Ordinary warnings and unreadable-memory `??` still require interpretation.
 
-Every accepted connection receives a monotonic generation. Queued work from a
-disconnected generation is dropped, and its responses/chunks cannot be sent to
-a replacement client. The extension keeps the same server pipe handle open
-between clients, so another process cannot claim the endpoint in the reconnect
-window.
+### Large Output and Timeouts
 
-## Wire protocol
+Set `output_file` before commands expected to produce large output. Use an
+absolute local path whose parent directory exists. The extension writes full
+UTF-8 content after execution, including available failure output, and returns
+a preview. Do not blindly repeat side-effecting commands merely to obtain a log.
 
-Length-prefixed JSON frames over a single full-duplex named pipe.
+`timeout_ms` is an execution budget from 1 to 120000 ms, not a promise to
+hard-cancel DbgEng. Expired queued commands are not started. If an individual
+command returns after its deadline, remaining top-level commands are skipped.
 
-```
-+------------------+----------------------------+
-|  4 bytes         |  N bytes                   |
-|  uint32 LE       |  UTF-8 JSON payload        |
-|  payload length  |                            |
-+------------------+----------------------------+
-```
+If the host receives no result after the budget plus 5 seconds of grace,
+it returns `execution_state="unknown"`, `execution_may_continue=true` and
+`safe_to_retry=false`. **An in-flight command may continue; prior effects are
+not rolled back.** Wait for the debugger to respond and inspect state before
+submitting further work.
 
-Six frame kinds: `hello` / `req` / `resp` / `ack` / `event` / `chunk`. Requests are
-multiplexed by `id`; events are pushed asynchronously. Multiple WinDbg/host
-pairs can coexist when each pair uses a unique endpoint. See
-`docs/protocol.md` for the full spec and error-code list.
+## Lifecycle and Isolation
 
-## Repository layout
+`wm_detach` affects the target; `wm_shutdown` stops only the bridge. To end
+the stdio MCP host, the client must close or terminate its `windbg-mcp.exe`.
+Do not treat bridge shutdown as process exit.
 
-```
-windbg-mcp/
-├── CMakeLists.txt                top-level CMake
-├── README.md / README_zh.md      this file (English / Chinese)
-├── docs/
-│   ├── protocol.md               pipe frame spec, error codes, timeouts
-│   ├── events.md                 event catalogue + history-replay semantics
-│   └── tools.md                  MCP tool surface, signatures, workflows
-├── ext/                          C++ WinDbg extension DLL
-│   ├── CMakeLists.txt
-│   └── src/{ipc,events,handlers,util}
-├── host/                         C++ MCP server (stdio + pipe bridge)
-│   ├── CMakeLists.txt
-│   └── src/{transport,mcp,tools,analysis,util}
-└── tests/
-    ├── ext/                      gtest: codec, event history
-    └── host/                     gtest: frame codec, parsers, endpoint/options
-```
+Transient disconnects can reconnect to the same extension instance. A newly
+started extension has a new `bridge_instance_id`, even on the same endpoint.
+Restart the MCP host to bind it. Queued requests and late responses from an
+old connection are not transferred to its replacement.
 
-## Status
+`wm_run_cmd` rejects lifecycle commands such as `!mcpext.*`, `.unload`,
+`.reboot` and debugger quit, preventing extension unload on an active worker
+stack. Use dedicated tools, or stop the bridge with `!mcpext.stop` in the
+debugger before manual lifecycle operations.
 
-v2.0. The pipe transport, event push, core debugging operations, and the
-`.reboot` lifecycle have been validated against live kernel-debug sessions
-(VirtualKD + WinDbg Preview). Known limitations:
+These checks are not a sandbox for arbitrary debugger scripts. They cannot
+validate every action hidden in aliases, script files or extensions. Expose
+only your own debugging environment to trusted agents.
 
-- requests within one WinDbg instance execute FIFO on a single dbgeng worker;
-  this intentionally trades same-session request parallelism for correct
-  `IDebugClient` thread affinity. A long `wm_wait_event` therefore delays
-  later requests on that same endpoint. Parallelism is across distinct
-  endpoints
-- `wm_analyze_crash` parser was developed against Windows 10 / 11
-  `!analyze -v` output; older versions may need parser updates
+## Example
+
+The [Harness HelloWorld example](https://github.com/Letenz/windows-drv-harness/tree/main/example/HelloWorld)
+uses this bridge for driver debugging and evidence collection. Its workflow
+has been completed successfully using `qwen3.8-flash` and `glm-5.3-flash`.
+
+## Usage Limits
+
+- Requests within one debugger endpoint execute serially. Long commands or event waits delay later work; parallelism is across separate sessions.
+- Crash parsing depends on symbols, debugger output and target information. Fields may be unavailable; retain raw text and logs for verification.
+- DbgEng executes control blocks internally. Per-command stop/deadline handling applies to top-level statements, not every step inside a block.
+
+See the [tool reference](docs/tools.md), [event semantics](docs/events.md) and
+[pipe protocol](docs/protocol.md) for details.
 
 ## License
 
-MIT. See `LICENSE`.
+MIT. Third-party dependencies retain their own licenses.

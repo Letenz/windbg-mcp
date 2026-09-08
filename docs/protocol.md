@@ -158,6 +158,11 @@ Events and responses are not allowed ahead of the greeting.
 Exactly one `resp` frame is emitted per `req`, unless the request switched to
 `chunk` streaming — see below.
 
+For `run_cmd`, transport success can contain `data.ok=false`: execution reached
+the handler but a command or output-file write failed. Keep `data.results`,
+partial `data.output` and `data.err` intact; the MCP host maps this to
+`isError=true` rather than discarding the evidence.
+
 A terminal response additionally contains `"terminal": true`. The host must
 write the transport ACK below before exposing that response to its caller.
 
@@ -257,16 +262,24 @@ zero and `bugcheck` is `null` until the target is broken in.
 
 ### `run_cmd`
 
-Raw passthrough to `IDebugControl::Execute`. The cmd string is fed verbatim,
-including embedded newlines (interpreted by dbgeng as separate commands).
+UTF-8 command batches through `IDebugControl4::ExecuteWide`. The extension
+splits top-level semicolons and actual newlines, preserving quotes, expressions,
+control blocks and line-owning commands. See [tools.md](tools.md#wm_run_cmd)
+for validation, per-command results and run-control restrictions.
 
 Args:
 
 - `cmd` (required) — the command text, UTF-8.
-- `timeout_ms` — defaults to STANDARD (30000). Hard ceiling enforced server-side.
-- `output_file` — absolute path. Triggers `chunk` streaming. Server writes
-  every chunk to this file as it arrives; the final `resp.data.output` carries
-  only a preview, not the whole body.
+- `timeout_ms` — defaults to STANDARD (30000), range 1..120000. A command-start
+  budget, not hard cancellation of DbgEng execution.
+- `deadline_tick_ms` — internal host-to-extension deadline from the same
+  machine's `GetTickCount64()`, so extension queue time consumes the budget.
+  Not an MCP tool argument. Older clients may omit it; the extension then
+  starts the budget on handler entry.
+- `output_file` — absolute local path. The extension writes the buffered UTF-8
+  output once, including partial errors, then emits valid UTF-8 `chunk` frames.
+  The host must not open a second truncating writer. The final response carries
+  a preview, `output_file_written`, and `output_file_error` if writing failed.
 - `preview_bytes` — head bytes in the preview. Default 8192. The preview always
   also includes the last 2 KiB.
 
@@ -274,6 +287,11 @@ Success `data`:
 
 ```jsonc
 {
+  "ok":                   true,
+  "commands_total":       1,
+  "commands_executed":    1,
+  "commands_skipped":     0,
+  "results":              [{"index": 0, "command": "r", "status": "succeeded", "output": "..."}],
   "output":               "...",      // preview (head + tail), or full body if < 256 KiB
   "output_file":          "F:/...",   // echoed when output_file was set
   "bytes_total":          123456,
@@ -400,8 +418,8 @@ bridge shutdown.
 | `disconnected`     | selected endpoint is absent, mismatched, busy, or broke mid-request | start the extension and host with the same endpoint |
 | `not_attached`     | dbgeng has no target | wait for KD or open a dump |
 | `target_running`   | op requires broken state but target is GO | call `wm_break_in` first |
-| `timeout`          | `timeout_ms` elapsed | raise timeout or check if target hung |
-| `engine_error`     | dbgeng API returned non-S_OK; `err.hr` populated | inspect hr, retry |
+| `timeout`          | budget or response wait elapsed | inspect state; never assume cancellation or blindly retry |
+| `engine_error`     | dbgeng API failed or emitted error output | inspect HRESULT and partial output before further commands |
 | `invalid_arg`      | arg failed validation server-side | fix the named arg |
 
 `run_cmd` also returns `invalid_arg` for lifecycle-changing commands such as
@@ -425,20 +443,22 @@ Three named tiers shared between server and ext:
 Any `timeout_ms` supplied in `req.args` overrides the default. The ext enforces
 its own deadline independently of the server; if the ext times out first it
 emits a `resp` with `err.code = "timeout"`. If the server times out first it
-cancels by closing the request slot — the ext is still allowed to finish but
-its `resp` is discarded.
+closes the response slot; this is not cancellation of the executing command.
+For `run_cmd`, a command already inside DbgEng may continue after timeout.
+Remaining top-level commands are skipped when it returns. A host timeout or
+disconnect carries `execution_may_continue=true`, `execution_state="unknown"`,
+and `safe_to_retry=false`; its late response is discarded.
 
 ## Escaping & encoding
 
 - All payloads are UTF-8 JSON. The JSON encoder handles every special
   character (`"`, `\`, control bytes, multi-byte UTF-8) automatically. No
-  layer below the JSON encoder does string manipulation.
-- WinDbg native output is ANSI in the current console codepage (usually 1252).
-  The ext converts to UTF-8 via `MultiByteToWideChar(CP_ACP, ...)` →
-  `WideCharToMultiByte(CP_UTF8, ...)` before placing it in a JSON string.
-- `cmd` strings are passed to `IDebugControl::Execute` byte-for-byte after
-  JSON decoding. The ext does **not** quote, escape, or split. Multi-command
-  scripts use literal newlines in the JSON string (`"\n"`).
+  layer should double-unescape the command text.
+- `run_cmd` converts UTF-8 input to UTF-16 for `ExecuteWide`, captures
+  `IDebugOutputCallbacksWide`, then encodes UTF-8 for results and files.
+  Preview and chunk boundaries never split a UTF-8 code point.
+- After JSON decoding, `cmd` is split only at supported top-level separators.
+  Actual newlines separate statements; literal backslash plus `n` does not.
 - Paths in `output_file` are UTF-8 in the protocol and converted to UTF-16
   (`-W` Win32 APIs) when opening the file.
 

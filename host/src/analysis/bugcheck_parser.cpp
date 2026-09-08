@@ -157,28 +157,6 @@ json ParseBugcheck(std::string_view text) {
 
 json ParseFaulting(std::string_view text) {
     auto lines = Split_lines(text);
-
-    // Classic: a line "FAULTING_IP:" followed by symbol then address.
-    for (std::size_t i = 0; i + 2 < lines.size(); ++i) {
-        if (lines[i] == "FAULTING_IP:") {
-            const std::string& sym  = lines[i + 1];
-            const std::string& addr = lines[i + 2];
-            // addr line begins with hex (possibly with `).
-            static const std::regex addr_re(R"(^([0-9a-fA-F`]+))");
-            std::smatch m;
-            if (std::regex_search(addr, m, addr_re)) {
-                auto sp = SplitSymbol(sym);
-                json out = json::object();
-                out["ip"]       = HexWithPrefix(m[1].str());
-                out["module"]   = sp.module.empty()   ? json(nullptr) : json(sp.module);
-                out["function"] = sp.function.empty() ? json(nullptr) : json(sp.function);
-                out["offset"]   = sp.offset.empty()   ? json(nullptr) : json(sp.offset);
-                out["source"]   = json(nullptr);
-                return out;
-            }
-        }
-    }
-
     auto kv = KvTable(lines);
     auto pick = [&](std::initializer_list<const char*> keys) -> std::string {
         for (auto k : keys) {
@@ -187,19 +165,63 @@ json ParseFaulting(std::string_view text) {
         }
         return {};
     };
-    std::string sym  = pick({"FAILURE_SYMBOL_NAME", "FAILURE_FUNC_NAME"});
+    std::string sym = pick({"FAILURE_SYMBOL_NAME", "FAILURE_FUNC_NAME", "SYMBOL_NAME"});
     std::string addr = pick({"FAULT_INSTR_ADDR_HEX", "FAULTING_INSTR_ADDR"});
-    if (!sym.empty()) {
-        auto sp = SplitSymbol(sym);
-        json out = json::object();
-        out["ip"]       = addr.empty() ? json(nullptr) : json(HexWithPrefix(addr));
-        out["module"]   = sp.module.empty()   ? json(nullptr) : json(sp.module);
-        out["function"] = sp.function.empty() ? json(nullptr) : json(sp.function);
-        out["offset"]   = sp.offset.empty()   ? json(nullptr) : json(sp.offset);
-        out["source"]   = json(nullptr);
-        return out;
+    static const std::regex exception_re(
+        R"(^ExceptionAddress:\s+([0-9a-fA-F`]+)\s+\(([^)]+)\))");
+    for (const auto& line : lines) {
+        std::smatch m;
+        if (std::regex_search(line, m, exception_re)) {
+            addr = m[1].str();
+            sym = m[2].str();
+            break;
+        }
     }
-    return json(nullptr);
+    for (std::size_t i = 0; i + 2 < lines.size(); ++i) {
+        if (lines[i] == "FAULTING_IP:") {
+            static const std::regex addr_re(R"(^([0-9a-fA-F`]+))");
+            std::smatch m;
+            if (std::regex_search(lines[i + 2], m, addr_re)) {
+                sym = lines[i + 1];
+                addr = m[1].str();
+                break;
+            }
+        }
+    }
+    if (sym.empty()) return json(nullptr);
+    auto sp = SplitSymbol(sym);
+    json out = {
+        {"ip", addr.empty() ? json(nullptr) : json(HexWithPrefix(addr))},
+        {"module", sp.module.empty() ? json(nullptr) : json(sp.module)},
+        {"function", sp.function.empty() ? json(nullptr) : json(sp.function)},
+        {"offset", sp.offset.empty() ? json(nullptr) : json(sp.offset)},
+        {"source", nullptr},
+    };
+    const auto file = pick({"FAULTING_SOURCE_FILE", "FAULTING_SOURCE_LINE"});
+    const auto line_number = pick({"FAULTING_SOURCE_LINE_NUMBER"});
+    if (!file.empty()) {
+        out["source"] = {{"file", file}, {"line", nullptr}};
+        if (!line_number.empty() &&
+            std::all_of(line_number.begin(), line_number.end(),
+                        [](unsigned char c) { return std::isdigit(c); })) {
+            out["source"]["line"] = std::stoi(line_number);
+        }
+    }
+    static const std::regex access_re(
+        R"(Attempt to (read|write|execute)(?: from| to)? address\s+([0-9a-fA-F`]+))");
+    static const std::regex instruction_re(
+        R"(^\s*([0-9a-fA-F`]+)\s+[0-9a-fA-F]+\s+(.+)$)");
+    for (const auto& line : lines) {
+        std::smatch m;
+        if (std::regex_search(line, m, access_re)) {
+            out["access"] = {{"operation", m[1].str()}, {"address", HexWithPrefix(m[2].str())}};
+        }
+        if (!addr.empty() && std::regex_match(line, m, instruction_re)
+            && HexWithPrefix(m[1].str()) == HexWithPrefix(addr)) {
+            out["instruction"] = m[2].str();
+        }
+    }
+    return out;
 }
 
 json ParseProbableCulprit(std::string_view text) {
